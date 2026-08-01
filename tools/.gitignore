@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Capture data: large binaries, not source.
+data/
+*.csi
