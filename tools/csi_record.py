@@ -348,6 +348,8 @@ async def main():
                    help="stop after N seconds (0 = until Ctrl-C)")
     p.add_argument("--lead-in", type=float, default=15,
                    help="seconds between blocks to walk into position (default 15)")
+    p.add_argument("--label", default="check",
+                   help="label to use with --duration (default 'check')")
     args = p.parse_args()
 
     rec = Recorder(args.out, args.csv)
@@ -381,17 +383,25 @@ async def main():
     print(f"Frames arriving. Good.\n")
 
     tasks = [asyncio.create_task(status_loop(rec))]
+    main_task = None
     if args.protocol:
-        tasks.append(asyncio.create_task(run_protocol(rec, DEFAULT_PROTOCOL, args.lead_in)))
-    else:
-        tasks.append(asyncio.create_task(manual_labels(rec)))
+        main_task = asyncio.create_task(run_protocol(rec, DEFAULT_PROTOCOL, args.lead_in))
+        tasks.append(main_task)
+    elif args.duration <= 0:
+        # Only read stdin when we have no other stop condition. A blocking
+        # readline() cannot be cancelled, and asyncio waits for executor threads
+        # at shutdown, so starting it alongside --duration hangs the exit.
+        main_task = asyncio.create_task(manual_labels(rec))
+        tasks.append(main_task)
+
+    if args.duration > 0:
+        rec.set_label(args.label)
 
     try:
         if args.duration > 0:
             await asyncio.sleep(args.duration)
-        else:
-            # Finish when the protocol task finishes; otherwise run until Ctrl-C.
-            await tasks[1]
+        elif main_task is not None:
+            await main_task
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
