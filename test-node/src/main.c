@@ -8,13 +8,27 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
+#include "credentials.h"
 
 // --- CONFIGURATION ---
-#define WIFI_SSID ""
-#define WIFI_PASS ""
-#define TARGET_IP "192.168.1.51" // RASPBERRY PI IP
-#define TARGET_PORT 5005
-#define NODE_ID 1
+// Array sizes must be true compile-time constants in C, so those two live in
+// an enum; everything else is a plain const (no #define).
+enum
+{
+    CSI_MAX_FRAME_LEN = 384, // max raw CSI payload length ESP-IDF may report
+    TX_BUF_LEN = 512,        // scratch buffer for header + CSI payload
+};
+
+static const char *TARGET_IP = CSI_TARGET_IP;
+static const uint16_t TARGET_PORT = CSI_TARGET_PORT;
+static const uint8_t NODE_ID = 1;
+static const uint32_t ADR018_MAGIC = 0xC5110001;
+static const uint8_t NUM_ANTENNAS = 1;
+static const uint32_t WIFI_CHANNEL_FREQ_MHZ = 2412; // channel 1, 2.4 GHz
+static const UBaseType_t CSI_QUEUE_DEPTH = 10; // frames
+static const uint32_t CSI_TX_THROTTLE_MS = 20; // ~50 Hz cap
+static const uint32_t CSI_TX_TASK_STACK_WORDS = 4096;
+static const UBaseType_t CSI_TX_TASK_PRIORITY = 5;
 // ---------------------
 
 static const char *TAG = "ESP32_CSI_NODE";
@@ -41,7 +55,7 @@ typedef struct
     uint16_t len;
     int8_t rssi;
     int8_t noise_floor;
-    uint8_t buf[384];
+    uint8_t buf[CSI_MAX_FRAME_LEN];
 } csi_packet_t;
 
 // --- CSI ISR / CALLBACK (Non-blocking, enqueues packets) ---
@@ -51,7 +65,7 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
         return;
 
     // Drop oversized frames safely
-    if (info->len > 384)
+    if (info->len > CSI_MAX_FRAME_LEN)
         return;
 
     csi_packet_t pkt;
@@ -68,7 +82,7 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
 static void csi_tx_task(void *pvParameters)
 {
     csi_packet_t pkt;
-    uint8_t tx_buf[512];
+    uint8_t tx_buf[TX_BUF_LEN];
 
     while (1)
     {
@@ -84,11 +98,11 @@ static void csi_tx_task(void *pvParameters)
                 continue;
 
             adr018_header_t *hdr = (adr018_header_t *)tx_buf;
-            hdr->magic = 0xC5110001;
+            hdr->magic = ADR018_MAGIC;
             hdr->node_id = NODE_ID;
-            hdr->num_antennas = 1;
+            hdr->num_antennas = NUM_ANTENNAS;
             hdr->num_subcarriers = num_subcarriers;
-            hdr->freq_mhz = 2412;
+            hdr->freq_mhz = WIFI_CHANNEL_FREQ_MHZ;
             hdr->sequence = seq_num++;
             hdr->rssi = pkt.rssi;
             hdr->noise_floor = pkt.noise_floor;
@@ -102,8 +116,7 @@ static void csi_tx_task(void *pvParameters)
                 ESP_LOGE(TAG, "Error during sendto: errno %d", errno);
             }
 
-            // ~50 Hz throttle (20ms rate-limiting)
-            vTaskDelay(pdMS_TO_TICKS(20));
+            vTaskDelay(pdMS_TO_TICKS(CSI_TX_THROTTLE_MS));
         }
     }
 }
@@ -113,6 +126,13 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     {
+        ESP_LOGI(TAG, "Connecting to Wi-Fi SSID \"%s\"...", WIFI_SSID);
+        esp_wifi_connect();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "Wi-Fi disconnected from SSID \"%s\" (reason=%d), retrying...", WIFI_SSID, disconn->reason);
         esp_wifi_connect();
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
@@ -156,11 +176,12 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
-    // Create FreeRTOS packet queue (depth: 10 frames)
-    csi_queue = xQueueCreate(10, sizeof(csi_packet_t));
+    csi_queue = xQueueCreate(CSI_QUEUE_DEPTH, sizeof(csi_packet_t));
 
     // Spawn CSI TX Worker Task
-    xTaskCreatePinnedToCore(csi_tx_task, "csi_tx_task", 4096, NULL, 5, NULL, 1);
+    // ESP32-C3 is single-core, so this runs unpinned instead of on core 1.
+    xTaskCreate(csi_tx_task, "csi_tx_task", CSI_TX_TASK_STACK_WORDS, NULL,
+                CSI_TX_TASK_PRIORITY, NULL);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
