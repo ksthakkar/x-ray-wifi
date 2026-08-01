@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -17,7 +18,17 @@ enum
 {
     CSI_MAX_FRAME_LEN = 384, // max raw CSI payload length ESP-IDF may report
     TX_BUF_LEN = 512,        // scratch buffer for header + CSI payload
+    PRESENCE_MAX_SC = 192,   // CSI_MAX_FRAME_LEN / 2 I/Q pairs
+    PRESENCE_BAR_WIDTH = 40, // serial bar-graph width, in characters
 };
+
+// Presence smoke test tuning.
+static const float PRESENCE_BASELINE_ALPHA = 0.02f; // slow: tracks the empty room
+static const float PRESENCE_SMOOTH_ALPHA = 0.25f;   // fast: smooths frame jitter
+static const uint16_t PRESENCE_MIN_SC = 8;          // ignore implausibly short frames
+static const uint32_t PRESENCE_WARMUP_FRAMES = 100; // let the baseline settle
+static const uint32_t PRESENCE_LOG_EVERY = 10;      // ~5 Hz at the 50 Hz cap
+static const float PRESENCE_BAR_SCALE = 0.8f;       // score 50 fills the bar
 
 static const char *TARGET_IP = CSI_TARGET_IP;
 static const uint16_t TARGET_PORT = CSI_TARGET_PORT;
@@ -47,7 +58,7 @@ typedef struct __attribute__((packed))
     uint32_t sequence;        // Sequence counter
     int8_t rssi;              // Signal strength (dBm)
     int8_t noise_floor;       // Noise floor
-    uint16_t reserved;        // Padding
+    uint16_t motion_q8;       // Presence score, fixed-point (score * 256), 0xFFFF = warming up
 } adr018_header_t;
 
 typedef struct
@@ -57,6 +68,103 @@ typedef struct
     int8_t noise_floor;
     uint8_t buf[CSI_MAX_FRAME_LEN];
 } csi_packet_t;
+
+// --- PRESENCE SMOKE TEST ---
+// Goal: prove a human near the antenna moves the needle, before building the
+// full pipeline. Raw CSI looks like noise because each frame's absolute scale
+// and phase depend on the radio's AGC and packet timing, not on the room.
+// Amplitude *shape* is far more stable, so we measure how far the current
+// frame's shape sits from a slowly-adapting baseline. Empty room reads near 0;
+// a hand over the board spikes hard.
+static float s_baseline[PRESENCE_MAX_SC];
+static uint16_t s_baseline_sc = 0; // subcarrier count the baseline was built for
+static uint32_t s_baseline_frames = 0;
+static float s_motion_smoothed = 0.0f;
+
+// Returns a smoothed motion score (0..~100), or -1 while still warming up.
+static float presence_update(const uint8_t *buf, uint16_t len)
+{
+    uint16_t n = len / 2;
+    if (n < PRESENCE_MIN_SC)
+        return -1.0f;
+    if (n > PRESENCE_MAX_SC)
+        n = PRESENCE_MAX_SC;
+
+    // CSI buffer holds interleaved int8 pairs; ESP-IDF orders them (imag, real).
+    float amp[PRESENCE_MAX_SC];
+    float sum = 0.0f;
+    for (uint16_t i = 0; i < n; i++)
+    {
+        float im = (float)(int8_t)buf[2 * i];
+        float re = (float)(int8_t)buf[2 * i + 1];
+        amp[i] = sqrtf(re * re + im * im);
+        sum += amp[i];
+    }
+
+    // Normalize by the frame's own mean. This is the step that makes the signal
+    // legible: it cancels AGC gain jumps, which otherwise dwarf a human.
+    if (sum < 1e-3f)
+        return -1.0f;
+    float mean = sum / (float)n;
+    for (uint16_t i = 0; i < n; i++)
+        amp[i] /= mean;
+
+    // Subcarrier count varies by frame type (LLTF vs HT-LTF). Mixing types would
+    // corrupt the baseline, so rebuild it when the width changes.
+    if (n != s_baseline_sc)
+    {
+        s_baseline_sc = n;
+        s_baseline_frames = 0;
+        s_motion_smoothed = 0.0f;
+        memcpy(s_baseline, amp, n * sizeof(float));
+    }
+
+    // Mean absolute deviation from baseline, scaled into a readable range.
+    float dev = 0.0f;
+    for (uint16_t i = 0; i < n; i++)
+        dev += fabsf(amp[i] - s_baseline[i]);
+    dev = (dev / (float)n) * 100.0f;
+
+    for (uint16_t i = 0; i < n; i++)
+        s_baseline[i] += PRESENCE_BASELINE_ALPHA * (amp[i] - s_baseline[i]);
+
+    // Report nothing until the baseline settles, else startup reads as motion.
+    if (s_baseline_frames < PRESENCE_WARMUP_FRAMES)
+    {
+        s_baseline_frames++;
+        return -1.0f;
+    }
+
+    s_motion_smoothed += PRESENCE_SMOOTH_ALPHA * (dev - s_motion_smoothed);
+    return s_motion_smoothed;
+}
+
+// Log a bar graph so motion is obvious by eye on the serial monitor.
+static void presence_log(float score, uint16_t n_sc, int8_t rssi)
+{
+    char bar[PRESENCE_BAR_WIDTH + 1];
+    int fill = (int)(score * PRESENCE_BAR_SCALE);
+    if (fill > PRESENCE_BAR_WIDTH)
+        fill = PRESENCE_BAR_WIDTH;
+    if (fill < 0)
+        fill = 0;
+    memset(bar, '#', fill);
+    memset(bar + fill, '.', PRESENCE_BAR_WIDTH - fill);
+    bar[PRESENCE_BAR_WIDTH] = '\0';
+
+    ESP_LOGI(TAG, "motion %6.2f |%s| sc=%u rssi=%d", score, bar, n_sc, rssi);
+}
+
+// Pack the score for the wire. 0xFFFF is the "warming up" sentinel.
+static uint16_t presence_to_q8(float score)
+{
+    if (score < 0.0f)
+        return 0xFFFF;
+    float q = score * 256.0f;
+    if (q > 65534.0f)
+        q = 65534.0f;
+    return (uint16_t)q;
+}
 
 // --- CSI ISR / CALLBACK (Non-blocking, enqueues packets) ---
 static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
@@ -83,15 +191,23 @@ static void csi_tx_task(void *pvParameters)
 {
     csi_packet_t pkt;
     uint8_t tx_buf[TX_BUF_LEN];
+    uint32_t log_ctr = 0;
 
     while (1)
     {
         if (xQueueReceive(csi_queue, &pkt, portMAX_DELAY) == pdTRUE)
         {
+            uint16_t num_subcarriers = pkt.len / 2;
+
+            // Runs on every frame (the baseline needs them all) but only logs
+            // periodically, so the serial monitor stays readable.
+            float motion = presence_update(pkt.buf, pkt.len);
+            if (motion >= 0.0f && (log_ctr++ % PRESENCE_LOG_EVERY) == 0)
+                presence_log(motion, num_subcarriers, pkt.rssi);
+
             if (sock < 0)
                 continue;
 
-            uint16_t num_subcarriers = pkt.len / 2;
             size_t payload_len = sizeof(adr018_header_t) + pkt.len;
 
             if (payload_len > sizeof(tx_buf))
@@ -106,7 +222,7 @@ static void csi_tx_task(void *pvParameters)
             hdr->sequence = seq_num++;
             hdr->rssi = pkt.rssi;
             hdr->noise_floor = pkt.noise_floor;
-            hdr->reserved = 0;
+            hdr->motion_q8 = presence_to_q8(motion);
 
             memcpy(tx_buf + sizeof(adr018_header_t), pkt.buf, pkt.len);
 

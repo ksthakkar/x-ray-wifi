@@ -3,7 +3,11 @@ CSI listener + live web viewer for the test-node ESP32 firmware.
 
 Receives ADR-018-framed UDP packets (magic 0xC5110001) from the ESP32,
 prints a decoded summary per packet to the console, and serves a live
-amplitude/RSSI graph at http://localhost:8080.
+amplitude/RSSI/motion graph at http://localhost:8080.
+
+The motion score is computed on the ESP32 (see the presence smoke test in
+test-node/src/main.c) and carried in the ADR-018 header, so the firmware's
+serial bar graph and this dashboard always show the same number.
 
 Usage:
     pip install -r requirements.txt
@@ -27,6 +31,14 @@ HEADER_FMT = "<IBBHIIbbH"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 assert HEADER_SIZE == 20, HEADER_SIZE
 
+# Header sentinel: firmware is still building its amplitude baseline.
+MOTION_WARMING_UP = 0xFFFF
+
+# Motion score above which we call it "presence". The firmware normalizes each
+# frame by its own mean amplitude, so an empty room sits near 0 and a hand over
+# the board reads well into double digits. Tune against your own room.
+MOTION_PRESENCE_THRESHOLD = 6.0
+
 clients: set[web.WebSocketResponse] = set()
 latest_frame: dict = {}
 
@@ -35,11 +47,14 @@ def parse_packet(data: bytes):
     if len(data) < HEADER_SIZE:
         return None
 
-    magic, node_id, num_antennas, num_subcarriers, freq_mhz, sequence, rssi, noise_floor, _reserved = (
+    magic, node_id, num_antennas, num_subcarriers, freq_mhz, sequence, rssi, noise_floor, motion_q8 = (
         struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
     )
     if magic != MAGIC:
         return None
+
+    # Motion arrives as fixed-point (score * 256); None means "still warming up".
+    motion = None if motion_q8 == MOTION_WARMING_UP else motion_q8 / 256.0
 
     csi_bytes = data[HEADER_SIZE:]
     n_pairs = len(csi_bytes) // 2
@@ -58,6 +73,7 @@ def parse_packet(data: bytes):
         "sequence": sequence,
         "rssi": rssi,
         "noise_floor": noise_floor,
+        "motion": motion,
         "amplitudes": amplitudes,
         "phases": phases,
         "ts": time.time(),
@@ -81,11 +97,15 @@ class CSIProtocol(asyncio.DatagramProtocol):
         amp_max = max(amps) if amps else 0.0
         amp_mean = (sum(amps) / len(amps)) if amps else 0.0
 
+        motion = frame["motion"]
+        motion_str = "  warmup" if motion is None else f"{motion:7.2f}"
+
         print(
             f"[{addr[0]}] seq={frame['sequence']:>8} node={frame['node_id']} "
             f"sc={frame['num_subcarriers']:>4} rssi={frame['rssi']:>4}dBm "
             f"noise={frame['noise_floor']:>4}dBm "
-            f"amp(min/mean/max)={amp_min:6.1f}/{amp_mean:6.1f}/{amp_max:6.1f}"
+            f"amp(min/mean/max)={amp_min:6.1f}/{amp_mean:6.1f}/{amp_max:6.1f} "
+            f"motion={motion_str}"
         )
 
         self.loop.create_task(broadcast(frame))
@@ -104,6 +124,12 @@ async def broadcast(frame: dict):
             "num_subcarriers": frame["num_subcarriers"],
             "amplitudes": amps,
             "amp_mean": (sum(amps) / len(amps)) if amps else 0.0,
+            "motion": frame["motion"],
+            "presence": (
+                frame["motion"] is not None
+                and frame["motion"] >= MOTION_PRESENCE_THRESHOLD
+            ),
+            "motion_threshold": MOTION_PRESENCE_THRESHOLD,
         }
     )
     dead = []
@@ -147,6 +173,15 @@ INDEX_HTML = """<!doctype html>
   canvas { background:#11141c; border:1px solid #232838; border-radius:8px; width:100%; height:220px; display:block; margin-bottom:1.2rem; }
   .status { font-size:.8rem; color:#8892a6; }
   .status.live { color:#5ee6a0; }
+  /* Motion / presence panel */
+  .stat.presence { min-width:170px; }
+  .stat.presence.on { border-color:#e6a35e; background:#20180f; }
+  #presence { color:#8892a6; }
+  .stat.presence.on #presence { color:#ffb765; }
+  .meter { height:10px; background:#232838; border-radius:5px; overflow:hidden; margin-top:.45rem; }
+  .meter-fill { height:100%; width:0%; background:#5ee6a0; border-radius:5px; transition:width .08s linear; }
+  .meter-fill.on { background:#ffb765; }
+  .section-label { margin-bottom:.4rem; color:#8892a6; font-size:.75rem; text-transform:uppercase; letter-spacing:.05em; }
 </style>
 </head>
 <body>
@@ -158,17 +193,26 @@ INDEX_HTML = """<!doctype html>
   <div class="stat"><div class="label">Subcarriers</div><div class="value" id="sc">-</div></div>
   <div class="stat"><div class="label">RSSI</div><div class="value" id="rssi">-</div></div>
   <div class="stat"><div class="label">Noise floor</div><div class="value" id="noise">-</div></div>
+  <div class="stat presence" id="presenceCard">
+    <div class="label">Motion / presence</div>
+    <div class="value"><span id="motion">-</span> <span id="presence" style="font-size:.8rem;">&nbsp;</span></div>
+    <div class="meter"><div class="meter-fill" id="motionFill"></div></div>
+  </div>
 </div>
 
-<div class="label" style="margin-bottom:.4rem;color:#8892a6;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;">Amplitude per subcarrier</div>
+<div class="section-label">Amplitude per subcarrier</div>
 <canvas id="amp" height="220"></canvas>
 
-<div class="label" style="margin-bottom:.4rem;color:#8892a6;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;">RSSI / mean amplitude history</div>
+<div class="section-label">Motion score history &mdash; flat when still, spikes when a hand covers the board</div>
+<canvas id="motionHist" height="220"></canvas>
+
+<div class="section-label">RSSI / mean amplitude history</div>
 <canvas id="hist" height="220"></canvas>
 
 <script>
 const ampCanvas = document.getElementById('amp');
 const histCanvas = document.getElementById('hist');
+const motionCanvas = document.getElementById('motionHist');
 const statusEl = document.getElementById('status');
 
 function fitCanvas(c) {
@@ -176,12 +220,17 @@ function fitCanvas(c) {
   c.width = rect.width * devicePixelRatio;
   c.height = rect.height * devicePixelRatio;
 }
-window.addEventListener('resize', () => { fitCanvas(ampCanvas); fitCanvas(histCanvas); });
-fitCanvas(ampCanvas); fitCanvas(histCanvas);
+window.addEventListener('resize', () => { fitCanvas(ampCanvas); fitCanvas(histCanvas); fitCanvas(motionCanvas); });
+fitCanvas(ampCanvas); fitCanvas(histCanvas); fitCanvas(motionCanvas);
 
 const rssiHistory = [];
 const ampHistory = [];
+const motionHistory = [];
 const HISTORY_LEN = 200;
+// Meter is full at this score; also the floor for the history y-axis, so an
+// idle trace stays visibly flat instead of auto-scaling noise to full height.
+const MOTION_FULL_SCALE = 40;
+let motionThreshold = null;
 
 function drawAmplitudes(amps) {
   const ctx = ampCanvas.getContext('2d');
@@ -196,6 +245,53 @@ function drawAmplitudes(amps) {
     ctx.fillStyle = `hsl(${hue}, 80%, 60%)`;
     ctx.fillRect(i * barW, h - barH, Math.max(barW - 1, 1), barH);
   }
+}
+
+function drawMotionHistory() {
+  const ctx = motionCanvas.getContext('2d');
+  const w = motionCanvas.width, h = motionCanvas.height;
+  ctx.clearRect(0, 0, w, h);
+  if (motionHistory.length < 2) return;
+
+  const max = Math.max(...motionHistory, MOTION_FULL_SCALE);
+  const yOf = (v) => h - (v / max) * (h - 10) - 5;
+
+  // Threshold line: above it, the server calls it presence.
+  if (motionThreshold !== null) {
+    ctx.strokeStyle = '#e6a35e';
+    ctx.setLineDash([6 * devicePixelRatio, 6 * devicePixelRatio]);
+    ctx.lineWidth = 1 * devicePixelRatio;
+    ctx.beginPath();
+    ctx.moveTo(0, yOf(motionThreshold));
+    ctx.lineTo(w, yOf(motionThreshold));
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  const stepX = w / (HISTORY_LEN - 1);
+  const startI = HISTORY_LEN - motionHistory.length;
+
+  // Filled area under the trace, so spikes read at a glance.
+  ctx.beginPath();
+  ctx.moveTo(startI * stepX, h);
+  motionHistory.forEach((v, i) => ctx.lineTo((startI + i) * stepX, yOf(v)));
+  ctx.lineTo((startI + motionHistory.length - 1) * stepX, h);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(94, 230, 160, 0.15)';
+  ctx.fill();
+
+  ctx.strokeStyle = '#5ee6a0';
+  ctx.lineWidth = 2 * devicePixelRatio;
+  ctx.beginPath();
+  motionHistory.forEach((v, i) => {
+    const x = (startI + i) * stepX, y = yOf(v);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  ctx.fillStyle = '#8892a6';
+  ctx.font = `${11 * devicePixelRatio}px ui-monospace, monospace`;
+  ctx.fillText(max.toFixed(0), 4 * devicePixelRatio, 14 * devicePixelRatio);
 }
 
 function drawHistory() {
@@ -241,6 +337,32 @@ function connect() {
     document.getElementById('sc').textContent = f.num_subcarriers;
     document.getElementById('rssi').textContent = f.rssi + ' dBm';
     document.getElementById('noise').textContent = f.noise_floor + ' dBm';
+
+    if (f.motion_threshold !== undefined) motionThreshold = f.motion_threshold;
+
+    const motionEl = document.getElementById('motion');
+    const presenceEl = document.getElementById('presence');
+    const cardEl = document.getElementById('presenceCard');
+    const fillEl = document.getElementById('motionFill');
+
+    if (f.motion === null || f.motion === undefined) {
+      // Firmware is still building its amplitude baseline.
+      motionEl.textContent = '--';
+      presenceEl.textContent = 'warming up';
+      cardEl.classList.remove('on');
+      fillEl.classList.remove('on');
+      fillEl.style.width = '0%';
+    } else {
+      motionEl.textContent = f.motion.toFixed(1);
+      presenceEl.textContent = f.presence ? 'PRESENCE' : 'clear';
+      cardEl.classList.toggle('on', !!f.presence);
+      fillEl.classList.toggle('on', !!f.presence);
+      fillEl.style.width = Math.min(100, (f.motion / MOTION_FULL_SCALE) * 100) + '%';
+
+      motionHistory.push(f.motion);
+      if (motionHistory.length > HISTORY_LEN) motionHistory.shift();
+      drawMotionHistory();
+    }
 
     drawAmplitudes(f.amplitudes);
 
