@@ -1,0 +1,74 @@
+# Classic ESP32 CSI Node — Default SDK Configuration
+#
+# This tree is a single-target (classic ESP32 / esp32dev) port of the
+# ruview-reference-node firmware, originally sdkconfig.defaults for ESP32-S3.
+# Unlike the multi-target reference tree (which layers a separate
+# sdkconfig.defaults.esp32-classic overlay via `idf.py -DSDKCONFIG_DEFAULTS=`),
+# this file bakes the classic-ESP32 settings in directly, because PlatformIO
+# only reliably auto-applies a single file named exactly `sdkconfig.defaults`
+# (confirmed against test-node/platformio.ini, which relies on the same
+# single-file behavior). This file is applied automatically by idf.py/pio
+# when no sdkconfig exists.
+#
+# See sdkconfig.defaults.esp32-classic for the pure-ESP-IDF multi-file overlay
+# equivalent (`idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32-classic"`),
+# kept for parity with the reference tree's overlay pattern and for anyone
+# building with plain idf.py instead of PlatformIO.
+
+# Target: classic ESP32
+CONFIG_IDF_TARGET="esp32"
+
+# Use custom partition table (4MB flash — typical classic ESP32 dev board)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+
+# Flash configuration: 4MB
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Compiler optimization: optimize for size to reduce binary
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# Enable CSI (Channel State Information) in WiFi driver
+CONFIG_ESP_WIFI_CSI_ENABLED=y
+
+# No AMOLED display, no onboard LED viz on classic ESP32 — see
+# sdkconfig.defaults.esp32-classic header for why (QSPI/LED GPIOs assume
+# ESP32-S3 hardware that doesn't exist here; main.c also falls back to
+# led_gpio=-1 on this target regardless).
+# CONFIG_DISPLAY_ENABLE is not set
+# CONFIG_LED_GAMMA_VIZ is not set
+
+# WASM3 (ADR-040) — chip-portable, keep enabled
+CONFIG_WASM_ENABLE=y
+
+# NVS encryption disabled by default (requires eFuse provisioning).
+# Enable only after burning HMAC key to eFuse block.
+# CONFIG_NVS_ENCRYPTION is not set
+
+# Disable unused features to reduce binary size
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# LWIP: enable extended socket options for UDP multicast
+CONFIG_LWIP_SO_RCVBUF=y
+
+# Carried from the S3 reference: UDP `sendto` returned ENOMEM in a tight loop
+# on both ESP32-S3 and ESP32-C6 at the CSI packet rate (CSI cb + status +
+# sync + feature_state all sharing the LWIP/WiFi pools). These bumps roughly
+# quadruple the relevant pools at ~3 KB extra heap cost.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
+
+# FreeRTOS: increase task stack for CSI processing
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Extra WiFi IRAM placement (defense-in-depth for RuView#396 SPI cache race)
+CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=y
+
+# ADR-081: adaptive_controller runs emit_feature_state + stream_sender
+# network I/O inside Timer Svc callbacks, exceeding the 2 KiB default.
+# Without this, the device bootloops with
+# "***ERROR*** A stack overflow in task Tmr Svc has been detected."
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=8192

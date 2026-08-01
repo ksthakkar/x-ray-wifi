@@ -1,0 +1,54 @@
+# Classic ESP32 CSI Node — Target overlay (idf.py multi-file workflow only)
+#
+# NOTE: sdkconfig.defaults in this tree already targets classic ESP32
+# directly (this is a single-target port, unlike the multi-target reference
+# tree). This file is redundant when building via PlatformIO (`pio run`),
+# which only auto-applies sdkconfig.defaults — kept only for parity with the
+# reference tree's overlay pattern, for anyone building with plain idf.py
+# and preferring an explicit two-file layering:
+#
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32-classic" set-target esp32
+#   idf.py build
+#
+# Hardware: generic ESP32 dev board (e.g. esp32dev / DevKitC / AZ-Delivery),
+# 4 MB flash, dual-core Xtensa LX6, no PSRAM assumed, no onboard addressable
+# LED, no AMOLED panel.
+
+# ── Target ──
+CONFIG_IDF_TARGET="esp32"
+
+# ── Flash & partitions (4 MB — typical for classic ESP32 dev boards) ──
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# ── CSI (required) ──
+CONFIG_ESP_WIFI_CSI_ENABLED=y
+
+# ── No display, no onboard LED viz on classic ESP32 ──
+# Display (ADR-045) needs QSPI pins (incl. GPIO 47/48) that don't exist on
+# classic ESP32, plus PSRAM framebuffers most classic ESP32 boards lack.
+# LED gamma-viz (ADR-183) defaults to GPIO 48, which also doesn't exist on
+# classic ESP32 (valid range 0-39) — main.c already falls back to led_gpio=-1
+# (disabled) on this target regardless, but disable at the Kconfig level too.
+# CONFIG_DISPLAY_ENABLE is not set
+# CONFIG_LED_GAMMA_VIZ is not set
+
+# ── WASM3 (ADR-040) — chip-portable, keep enabled ──
+CONFIG_WASM_ENABLE=y
+
+# ── Compiler ──
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# ── Logging ──
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ── lwIP / FreeRTOS — same tuning as S3 path (see sdkconfig.defaults) ──
+CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=8192
