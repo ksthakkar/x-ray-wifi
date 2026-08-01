@@ -1,0 +1,20 @@
+label,start_unix,end_unix,note
+unlabeled,1785623732.809036,1785623735.336553,
+transition_to_hand_on_board,1785623735.336553,1785623750.570249,moving into position; exclude from analysis
+hand_on_board,1785623750.570249,1785623781.080332,"Hold your hand right over the board. KNOWN-POSITIVE check: if analysis can't see this, the pipeline is broken and a null result elsewhere means nothing."
+transition_to_sitting,1785623781.080332,1785623796.313394,moving into position; exclude from analysis
+sitting,1785623796.313394,1785623826.680726,"Sit still in the room, ~1-2 m from the board."
+transition_to_moving,1785623826.680726,1785623841.875555,moving into position; exclude from analysis
+moving,1785623841.875555,1785623872.411488,Move around the room actively.
+transition_to_empty,1785623872.411488,1785623887.580132,moving into position; exclude from analysis
+empty,1785623887.580132,1785623948.150256,Leave the room entirely. Close the door.
+transition_to_moving,1785623948.150256,1785623963.389266,moving into position; exclude from analysis
+moving,1785623963.389266,1785623993.928354,Come back in and move around actively.
+transition_to_sitting,1785623993.928354,1785624009.174819,moving into position; exclude from analysis
+sitting,1785624009.174819,1785624039.568566,"Sit still again, same spot as before."
+transition_to_empty,1785624039.568566,1785624054.848911,moving into position; exclude from analysis
+empty,1785624054.848911,1785624115.444459,Leave the room again.
+transition_to_next_room,1785624115.444459,1785624130.739038,moving into position; exclude from analysis
+next_room,1785624130.739038,1785624191.374883,Go to the ADJACENT room and move around. THE REAL TEST.
+transition_to_empty_end,1785624191.374883,1785624206.646163,moving into position; exclude from analysis
+empty_end,1785624206.646163,1785624267.814972,Leave the room. Final baseline -- pairs with the earlier 'empty' blocks as an empty-vs-empty control.
