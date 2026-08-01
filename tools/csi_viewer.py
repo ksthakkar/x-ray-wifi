@@ -14,7 +14,9 @@ Usage:
     python csi_viewer.py [--udp-port 5005] [--http-port 8080]
 
 Point the ESP32's CSI_TARGET_IP (in test-node/src/credentials.h) at the
-machine running this script.
+machine running this script — normally the Arduino UNO Q on the same LAN,
+so the dashboard is reachable at http://<uno-q-ip>:8080 from any device on
+the network. A laptop works the same way for local dev.
 """
 
 import argparse

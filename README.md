@@ -153,6 +153,38 @@ This starts:
 
 Custom ports: `python tools/csi_viewer.py --udp-port 5005 --http-port 8080`.
 
+## Running the viewer on the UNO Q
+
+The end goal (see `CLAUDE.md`) is for the Arduino UNO Q, not a laptop, to be
+the always-on receiver — the ESP32 nodes stream CSI to it over Wi-Fi, and the
+same dashboard becomes reachable from any device on the LAN via the UNO Q's
+own IP. The UNO Q is a full Linux machine, so this is the same
+`csi_viewer.py` from step 3, just run there instead:
+
+1. Confirm the UNO Q is on the same Wi-Fi network as the ESP32 nodes.
+2. Find its LAN IP: `hostname -I` (or `ip addr`) on the UNO Q itself, or check
+   your router's DHCP client list.
+3. Get the viewer onto the UNO Q — clone this repo there, or `scp` over
+   `tools/csi_viewer.py` and `tools/requirements.txt` — then install its one
+   dependency:
+   ```bash
+   pip install -r tools/requirements.txt
+   ```
+4. Point the ESP32 at the UNO Q: set `CSI_TARGET_IP` in
+   `test-node/src/credentials.h` to the UNO Q's LAN IP (same as step 1 above,
+   just a different destination machine) and reflash.
+5. Run the viewer on the UNO Q:
+   ```bash
+   python3 tools/csi_viewer.py
+   ```
+6. From any device on the LAN, open `http://<uno-q-ip>:8080` to see the live
+   dashboard — no laptop needs to stay running.
+
+This covers visualization and collection only. Per `CLAUDE.md`, the UNO Q is
+also meant to eventually own fusion and inference across multiple nodes —
+that pipeline doesn't exist yet; this is just the wiring that gets CSI data
+onto the UNO Q in the first place.
+
 ## Interpreting what you see
 
 Raw per-frame CSI amplitude looks noisy even in an empty, static room —

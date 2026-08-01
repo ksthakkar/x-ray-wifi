@@ -729,25 +729,3 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 }
-
-/***
-docker stop ruview && docker rm ruview
-
-docker run -d \
-  --name ruview \
-  --restart always \
-  --net=host \
-  -e RUVIEW_ALLOW_UNAUTHENTICATED=1 \
-  -e SENSING_ALLOWED_HOSTS="192.168.1.51,192.168.1.51:8080,192.168.1.51:8765,localhost,localhost:8080,localhost:8765,127.0.0.1,*" \
-  -e WDP_DISABLE_HOST_VALIDATION=1 \
-  -e CSI_SOURCE=esp32 \
-  --entrypoint /app/sensing-server \
-  ruvnet/wifi-densepose:latest \
-  --source esp32 \
-  --bind-addr 0.0.0.0 \
-  --udp-port 5005 \
-  --http-port 8080 \
-  --ws-port 8765
- *
- *
- */
