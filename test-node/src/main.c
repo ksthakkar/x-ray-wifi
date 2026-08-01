@@ -23,6 +23,10 @@ enum
     TX_BUF_LEN = 512,        // scratch buffer for header + CSI payload
     PRESENCE_MAX_SC = 192,   // CSI_MAX_FRAME_LEN / 2 I/Q pairs
     PRESENCE_BAR_WIDTH = 40, // serial bar-graph width, in characters
+    // Independent baselines, one per distinct CSI frame width. Non-HT and HT
+    // frames interleave and carry different subcarrier counts, so a shared
+    // baseline never converges. 4 covers the widths a single channel produces.
+    PRESENCE_SLOTS = 4,
 };
 
 // Presence smoke test tuning.
@@ -32,6 +36,29 @@ static const uint16_t PRESENCE_MIN_SC = 8;          // ignore implausibly short 
 static const uint32_t PRESENCE_WARMUP_FRAMES = 100; // let the baseline settle
 static const uint32_t PRESENCE_LOG_EVERY = 10;      // ~5 Hz at the 50 Hz cap
 static const float PRESENCE_BAR_SCALE = 0.8f;       // score 50 fills the bar
+
+// The raw deviation score has no calibrated zero: its idle level depends on how
+// much ambient Wi-Fi traffic is around, so it can sit anywhere from ~1 to ~15
+// with nobody present. A fixed threshold is therefore meaningless. Instead we
+// track the idle floor (a slow minimum-follower) and report EXCESS over it.
+//
+// The floor falls fast toward quiet readings and rises only slowly, so it
+// settles onto the empty-room level and does not get dragged up by a person
+// standing there for a while.
+static const float NOISE_FLOOR_FALL = 0.05f;  // fast down toward quiet
+static const float NOISE_FLOOR_RISE = 0.0008f; // slow up (~30 s at 50 Hz)
+static const float NOISE_SCALE_ALPHA = 0.002f; // idle jitter estimate
+
+// Distance model. Excess energy falls off steeply with range, so a linear map
+// would put everything in the last few centimetres. We inverse-map instead:
+// excess == DIST_EXCESS_NEAR -> 0 m, and excess -> 0 gives MAX_RADIUS.
+//
+// THIS IS NOT CALIBRATED PHYSICS. It is a monotonic, repeatable proximity
+// indicator scaled into metres for readability. It cannot separate "close small
+// motion" from "distant large motion", because both produce the same excess.
+static const float DIST_MAX_RADIUS_M = 4.0f;  // reported when excess ~ 0
+static const float DIST_EXCESS_NEAR = 25.0f;  // excess that maps to 0 m
+static const float DIST_EXCESS_MIN = 2.0f;    // below this: "no target"
 
 static const char *TARGET_IP = CSI_TARGET_IP;
 static const uint16_t TARGET_PORT = CSI_TARGET_PORT;
@@ -50,6 +77,10 @@ static const UBaseType_t CSI_TX_TASK_PRIORITY = 5;
 // collapse into a periodic count.
 static const uint32_t STATS_REPORT_MS = 5000;
 static const uint32_t SEND_ERR_LOG_EVERY = 100;
+static const uint32_t QUEUE_DROP_LOG_EVERY = 200;
+// Warn when the queue high-water mark reaches this fraction of its depth --
+// the signal that added processing is close to costing us frames.
+static const uint32_t QUEUE_WARN_NUM = 3, QUEUE_WARN_DEN = 4; // 3/4 full
 // ---------------------
 
 // --- RUNTIME COUNTERS (diagnostics only) ---
@@ -63,6 +94,9 @@ static struct
     uint32_t tx_err_nomem;    // sendto() failed with ENOMEM (errno 12)
     uint32_t no_socket;       // skipped: socket not up yet
     uint32_t last_errno;      // most recent sendto() errno
+    uint32_t queue_peak;      // high-water mark of queue occupancy
+    uint32_t proc_us_max;     // slowest presence_update() seen, microseconds
+    uint32_t proc_us_avg_q8;  // EMA of presence_update() cost (us * 256)
 } s_stats;
 
 static const char *TAG = "ESP32_CSI_NODE";
@@ -82,6 +116,10 @@ typedef struct __attribute__((packed))
     int8_t rssi;              // Signal strength (dBm)
     int8_t noise_floor;       // Noise floor
     uint16_t motion_q8;       // Presence score, fixed-point (score * 256), 0xFFFF = warming up
+    // --- extension past the original 20-byte ADR-018 header ---
+    uint16_t excess_q8;       // Motion above the idle noise floor (* 256)
+    uint16_t floor_q8;        // Current idle noise floor (* 256), for diagnostics
+    uint16_t distance_cm;     // Pseudo-distance in cm, 0xFFFF = no target
 } adr018_header_t;
 
 typedef struct
@@ -99,10 +137,79 @@ typedef struct
 // Amplitude *shape* is far more stable, so we measure how far the current
 // frame's shape sits from a slowly-adapting baseline. Empty room reads near 0;
 // a hand over the board spikes hard.
-static float s_baseline[PRESENCE_MAX_SC];
-static uint16_t s_baseline_sc = 0; // subcarrier count the baseline was built for
-static uint32_t s_baseline_frames = 0;
+//
+// Frame width varies: with both lltf_en and htltf_en the driver interleaves
+// non-HT and HT frames, which carry different subcarrier counts. A single
+// baseline cannot span them (subcarrier i means a different frequency in each),
+// and resetting on every width change means warmup never completes. So each
+// width gets its own independent baseline slot.
+typedef struct
+{
+    uint16_t n_sc;       // subcarrier count this slot tracks; 0 = unused
+    uint32_t frames;     // frames accumulated (warmup progress)
+    float baseline[PRESENCE_MAX_SC];
+} presence_slot_t;
+
+static presence_slot_t s_slots[PRESENCE_SLOTS];
 static float s_motion_smoothed = 0.0f;
+static bool s_motion_valid = false;   // true once any slot has finished warmup
+static uint32_t s_slot_evictions = 0; // diagnostics: unexpected width churn
+
+// Idle-floor tracking, so "excess" has a meaningful zero regardless of how
+// much ambient traffic this environment carries.
+static float s_noise_floor = 0.0f;
+static float s_noise_jitter = 1.0f; // typical idle wobble, for the threshold
+static bool s_noise_init = false;
+static float s_excess = 0.0f;       // motion above the idle floor
+static float s_distance_m = -1.0f;  // -1 = no target
+
+// Map excess energy to a pseudo-distance. Inverse relationship: more excess
+// means closer. Returns -1 when there's nothing above the noise.
+static float excess_to_distance_m(float excess, float jitter)
+{
+    // Require the excess to clear both an absolute floor and this environment's
+    // own jitter, so a noisy room doesn't read as a permanent target.
+    float gate = DIST_EXCESS_MIN > jitter * 2.0f ? DIST_EXCESS_MIN : jitter * 2.0f;
+    if (excess < gate)
+        return -1.0f;
+    if (excess >= DIST_EXCESS_NEAR)
+        return 0.0f;
+
+    // Linear in 1/excess: d = MAX * (1 - excess/NEAR) keeps it monotonic and
+    // spreads the mid-range better than a straight linear map.
+    float frac = excess / DIST_EXCESS_NEAR; // 0..1
+    float d = DIST_MAX_RADIUS_M * (1.0f - frac) * (1.0f - frac);
+    return d;
+}
+
+// Find (or claim) the slot tracking this frame width. Returns NULL only if all
+// slots are taken by other widths.
+static presence_slot_t *presence_slot_for(uint16_t n_sc)
+{
+    for (unsigned i = 0; i < PRESENCE_SLOTS; i++)
+        if (s_slots[i].n_sc == n_sc)
+            return &s_slots[i];
+
+    for (unsigned i = 0; i < PRESENCE_SLOTS; i++)
+        if (s_slots[i].n_sc == 0)
+        {
+            s_slots[i].n_sc = n_sc;
+            s_slots[i].frames = 0;
+            ESP_LOGI(TAG, "presence: tracking new frame width %u sc (slot %u)", n_sc, i);
+            return &s_slots[i];
+        }
+
+    // More distinct widths than slots. Evict the least-warmed-up slot so we
+    // still converge instead of ignoring this width forever.
+    unsigned victim = 0;
+    for (unsigned i = 1; i < PRESENCE_SLOTS; i++)
+        if (s_slots[i].frames < s_slots[victim].frames)
+            victim = i;
+    s_slot_evictions++;
+    s_slots[victim].n_sc = n_sc;
+    s_slots[victim].frames = 0;
+    return &s_slots[victim];
+}
 
 // Returns a smoothed motion score (0..~100), or -1 while still warming up.
 static float presence_update(const uint8_t *buf, uint16_t len)
@@ -132,41 +239,73 @@ static float presence_update(const uint8_t *buf, uint16_t len)
     for (uint16_t i = 0; i < n; i++)
         amp[i] /= mean;
 
-    // Subcarrier count varies by frame type (LLTF vs HT-LTF). Mixing types would
-    // corrupt the baseline, so rebuild it when the width changes.
-    if (n != s_baseline_sc)
-    {
-        s_baseline_sc = n;
-        s_baseline_frames = 0;
-        s_motion_smoothed = 0.0f;
-        memcpy(s_baseline, amp, n * sizeof(float));
-    }
+    presence_slot_t *slot = presence_slot_for(n);
+
+    // First frame for this width: seed the baseline instead of measuring against
+    // zeros, which would read as a huge false spike.
+    if (slot->frames == 0)
+        memcpy(slot->baseline, amp, n * sizeof(float));
 
     // Mean absolute deviation from baseline, scaled into a readable range.
     float dev = 0.0f;
     for (uint16_t i = 0; i < n; i++)
-        dev += fabsf(amp[i] - s_baseline[i]);
+        dev += fabsf(amp[i] - slot->baseline[i]);
     dev = (dev / (float)n) * 100.0f;
 
     for (uint16_t i = 0; i < n; i++)
-        s_baseline[i] += PRESENCE_BASELINE_ALPHA * (amp[i] - s_baseline[i]);
+        slot->baseline[i] += PRESENCE_BASELINE_ALPHA * (amp[i] - slot->baseline[i]);
 
-    // Report nothing until the baseline settles, else startup reads as motion.
-    if (s_baseline_frames < PRESENCE_WARMUP_FRAMES)
+    // Report nothing until this width's baseline settles, else startup reads as
+    // motion. Other widths keep their own progress, so an interleaved stream
+    // still converges.
+    if (slot->frames < PRESENCE_WARMUP_FRAMES)
     {
-        s_baseline_frames++;
-        return -1.0f;
+        slot->frames++;
+        // Once any width is warm, keep reporting from it rather than dropping
+        // back to "warming up" every time a not-yet-warm width arrives.
+        return s_motion_valid ? s_motion_smoothed : -1.0f;
     }
+    // Counter has served its purpose; leave it parked at the threshold so it
+    // cannot wrap during a long run.
 
+    s_motion_valid = true;
     s_motion_smoothed += PRESENCE_SMOOTH_ALPHA * (dev - s_motion_smoothed);
+
+    // Track the idle floor: drop quickly toward quiet readings, rise slowly.
+    // This is what gives "excess" a stable zero across different environments.
+    if (!s_noise_init)
+    {
+        s_noise_init = true;
+        s_noise_floor = s_motion_smoothed;
+    }
+    else if (s_motion_smoothed < s_noise_floor)
+        s_noise_floor += NOISE_FLOOR_FALL * (s_motion_smoothed - s_noise_floor);
+    else
+        s_noise_floor += NOISE_FLOOR_RISE * (s_motion_smoothed - s_noise_floor);
+
+    s_excess = s_motion_smoothed - s_noise_floor;
+    if (s_excess < 0.0f)
+        s_excess = 0.0f;
+
+    // Estimate the idle wobble from samples near the floor only, so a present
+    // person doesn't inflate it.
+    if (s_excess < 2.0f)
+        s_noise_jitter += NOISE_SCALE_ALPHA * (s_excess - s_noise_jitter);
+
+    s_distance_m = excess_to_distance_m(s_excess, s_noise_jitter);
     return s_motion_smoothed;
 }
+
+float presence_excess(void) { return s_excess; }
+float presence_distance_m(void) { return s_distance_m; }
 
 // Log a bar graph so motion is obvious by eye on the serial monitor.
 static void presence_log(float score, uint16_t n_sc, int8_t rssi)
 {
     char bar[PRESENCE_BAR_WIDTH + 1];
-    int fill = (int)(score * PRESENCE_BAR_SCALE);
+    // Bar tracks excess, not the raw score: the raw idle level varies by room,
+    // so a raw bar is never comparable between setups.
+    int fill = (int)(s_excess * PRESENCE_BAR_SCALE);
     if (fill > PRESENCE_BAR_WIDTH)
         fill = PRESENCE_BAR_WIDTH;
     if (fill < 0)
@@ -175,7 +314,15 @@ static void presence_log(float score, uint16_t n_sc, int8_t rssi)
     memset(bar + fill, '.', PRESENCE_BAR_WIDTH - fill);
     bar[PRESENCE_BAR_WIDTH] = '\0';
 
-    ESP_LOGI(TAG, "motion %6.2f |%s| sc=%u rssi=%d", score, bar, n_sc, rssi);
+    // Show excess (the calibrated number) and the floor it was measured against;
+    // the raw score alone is not comparable between rooms.
+    float d = presence_distance_m();
+    if (d < 0.0f)
+        ESP_LOGI(TAG, "raw %6.2f floor %5.2f excess %6.2f |%s| dist    -- sc=%u rssi=%d",
+                 score, s_noise_floor, s_excess, bar, n_sc, rssi);
+    else
+        ESP_LOGI(TAG, "raw %6.2f floor %5.2f excess %6.2f |%s| dist %4.2fm sc=%u rssi=%d",
+                 score, s_noise_floor, s_excess, bar, d, n_sc, rssi);
 }
 
 // Pack the score for the wire. 0xFFFF is the "warming up" sentinel.
@@ -210,9 +357,28 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
     pkt.noise_floor = info->rx_ctrl.noise_floor;
     memcpy(pkt.buf, info->buf, info->len);
 
+    // Track queue occupancy before pushing: a high-water mark near the queue
+    // depth is the early warning that processing is too slow, visible BEFORE
+    // frames actually start dropping.
+    UBaseType_t waiting = uxQueueMessagesWaiting(csi_queue);
+    if (waiting > s_stats.queue_peak)
+        s_stats.queue_peak = (uint32_t)waiting;
+
     // Non-blocking queue send (drops packet if queue is full instead of stalling Wi-Fi task)
     if (xQueueSend(csi_queue, &pkt, 0) != pdTRUE)
+    {
         s_stats.queue_dropped++;
+
+        // This runs in the Wi-Fi driver's context, so logging must be cheap and
+        // rare. Log the first drop immediately (it marks when overload started),
+        // then only every Nth to avoid making the overload worse.
+        if (s_stats.queue_dropped == 1)
+            ESP_LOGW(TAG, "CSI QUEUE FULL - dropping frames. Processing cannot keep up "
+                          "with the frame rate (queue depth %u).", (unsigned)CSI_QUEUE_DEPTH);
+        else if ((s_stats.queue_dropped % QUEUE_DROP_LOG_EVERY) == 0)
+            ESP_LOGW(TAG, "CSI queue full: %lu frames dropped so far",
+                     (unsigned long)s_stats.queue_dropped);
+    }
 }
 
 // Human-readable name for the errnos this socket path realistically hits, so
@@ -252,6 +418,25 @@ static void log_stats(void)
              (unsigned long)s_stats.csi_frames,
              (unsigned long)s_stats.csi_oversized,
              (unsigned long)s_stats.queue_dropped);
+
+    // Queue health and per-frame processing cost. Together these say whether
+    // there is room for more processing: if proc avg approaches the frame
+    // interval (20 ms at 50 Hz), the queue will start backing up.
+    ESP_LOGI(TAG, "  queue: peak %lu/%u used, proc %lu us avg / %lu us max",
+             (unsigned long)s_stats.queue_peak, (unsigned)CSI_QUEUE_DEPTH,
+             (unsigned long)(s_stats.proc_us_avg_q8 >> 8),
+             (unsigned long)s_stats.proc_us_max);
+
+    if (s_stats.queue_dropped > 0)
+        ESP_LOGW(TAG, "  ^ %lu frames DROPPED (queue full). Processing is too slow "
+                      "for the frame rate - simplify it or raise CSI_QUEUE_DEPTH.",
+                 (unsigned long)s_stats.queue_dropped);
+    else if (s_stats.queue_peak * QUEUE_WARN_DEN >= (uint32_t)CSI_QUEUE_DEPTH * QUEUE_WARN_NUM)
+        ESP_LOGW(TAG, "  ^ queue reached %lu/%u - close to dropping frames.",
+                 (unsigned long)s_stats.queue_peak, (unsigned)CSI_QUEUE_DEPTH);
+
+    // Reset the peak each report so it reflects the last window, not all time.
+    s_stats.queue_peak = 0;
     ESP_LOGI(TAG, "  tx:   %lu ok, %lu err (%lu ENOMEM), %lu%% delivered, %lu no-socket",
              (unsigned long)s_stats.tx_ok,
              (unsigned long)s_stats.tx_err,
@@ -261,6 +446,26 @@ static void log_stats(void)
     ESP_LOGI(TAG, "  heap: %lu bytes free, min-ever %lu",
              (unsigned long)heap,
              (unsigned long)esp_get_minimum_free_heap_size());
+
+    // Per-width warmup progress. If a slot never reaches the threshold, that
+    // width is too rare to converge; if evictions climb, raise PRESENCE_SLOTS.
+    char slots[96];
+    size_t off = 0;
+    for (unsigned i = 0; i < PRESENCE_SLOTS && off < sizeof(slots) - 1; i++)
+    {
+        if (s_slots[i].n_sc == 0)
+            continue;
+        int w = snprintf(slots + off, sizeof(slots) - off, " %usc:%lu/%lu",
+                         s_slots[i].n_sc, (unsigned long)s_slots[i].frames,
+                         (unsigned long)PRESENCE_WARMUP_FRAMES);
+        if (w < 0 || (size_t)w >= sizeof(slots) - off)
+            break;
+        off += (size_t)w;
+    }
+    ESP_LOGI(TAG, "  presence: %s%s, evictions %lu",
+             s_motion_valid ? "ACTIVE" : "warming up",
+             off ? slots : " (no frames)",
+             (unsigned long)s_slot_evictions);
     if (s_stats.last_errno)
         ESP_LOGW(TAG, "  last sendto errno %lu (%s)",
                  (unsigned long)s_stats.last_errno, errno_hint((int)s_stats.last_errno));
@@ -289,7 +494,15 @@ static void csi_tx_task(void *pvParameters)
 
             // Runs on every frame (the baseline needs them all) but only logs
             // periodically, so the serial monitor stays readable.
+            // Timed, so the cost of any added processing is measurable against
+            // the frame interval before it starts causing drops.
+            int64_t t0 = esp_timer_get_time();
             float motion = presence_update(pkt.buf, pkt.len);
+            uint32_t proc_us = (uint32_t)(esp_timer_get_time() - t0);
+            if (proc_us > s_stats.proc_us_max)
+                s_stats.proc_us_max = proc_us;
+            // EMA in Q8 so it needs no float state.
+            s_stats.proc_us_avg_q8 += ((proc_us << 8) - s_stats.proc_us_avg_q8) >> 5;
             if (motion >= 0.0f && (log_ctr++ % PRESENCE_LOG_EVERY) == 0)
                 presence_log(motion, num_subcarriers, pkt.rssi);
 
@@ -327,6 +540,10 @@ static void csi_tx_task(void *pvParameters)
             hdr->rssi = pkt.rssi;
             hdr->noise_floor = pkt.noise_floor;
             hdr->motion_q8 = presence_to_q8(motion);
+            hdr->excess_q8 = presence_to_q8(presence_excess());
+            hdr->floor_q8 = presence_to_q8(s_noise_floor);
+            float d = presence_distance_m();
+            hdr->distance_cm = (d < 0.0f) ? 0xFFFF : (uint16_t)(d * 100.0f);
 
             memcpy(tx_buf + sizeof(adr018_header_t), pkt.buf, pkt.len);
 

@@ -21,40 +21,65 @@ import argparse
 import asyncio
 import json
 import math
+import socket
 import struct
 import time
 
 from aiohttp import web
 
 MAGIC = 0xC5110001
-HEADER_FMT = "<IBBHIIbbH"
+# Original 20-byte ADR-018 header, extended with the presence fields the
+# firmware now computes on-device (excess over noise floor, and pseudo-distance).
+HEADER_FMT = "<IBBHIIbbHHHH"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
-assert HEADER_SIZE == 20, HEADER_SIZE
+assert HEADER_SIZE == 26, HEADER_SIZE
+
+# Sentinel: firmware sees nothing above its noise floor.
+DISTANCE_NO_TARGET = 0xFFFF
 
 # Header sentinel: firmware is still building its amplitude baseline.
 MOTION_WARMING_UP = 0xFFFF
 
-# Motion score above which we call it "presence". The firmware normalizes each
-# frame by its own mean amplitude, so an empty room sits near 0 and a hand over
-# the board reads well into double digits. Tune against your own room.
-MOTION_PRESENCE_THRESHOLD = 6.0
+# Presence threshold, applied to EXCESS over the firmware's learned noise floor
+# -- not to the raw score. The raw idle level depends on ambient Wi-Fi traffic
+# (observed anywhere from ~1 to ~15), so thresholding it directly gives constant
+# false positives. Excess is ~0 when idle regardless of environment.
+MOTION_PRESENCE_THRESHOLD = 4.0
+
+# The ESP32 sends at ~50 Hz. Encoding JSON and pushing a WebSocket frame per
+# packet -- and redrawing three canvases per packet in the browser -- is far more
+# than a display needs, and it makes the page lag. Instead the UDP handler only
+# stores the newest frame, and a timer broadcasts at this rate. Dropping stale
+# frames is the right trade for a live view: we always show the latest state.
+BROADCAST_HZ = 15
+
+# Console printing is the other bottleneck: stdout is line-buffered and blocking,
+# so a print() per packet stalls the event loop. Print a summary this often
+# instead (0 disables per-packet logging entirely).
+CONSOLE_LOG_HZ = 2
 
 clients: set[web.WebSocketResponse] = set()
 latest_frame: dict = {}
+packets_received = 0
+packets_per_sec = 0.0
 
 
 def parse_packet(data: bytes):
     if len(data) < HEADER_SIZE:
         return None
 
-    magic, node_id, num_antennas, num_subcarriers, freq_mhz, sequence, rssi, noise_floor, motion_q8 = (
-        struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
-    )
+    (
+        magic, node_id, num_antennas, num_subcarriers, freq_mhz, sequence,
+        rssi, noise_floor, motion_q8, excess_q8, floor_q8, distance_cm,
+    ) = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
     if magic != MAGIC:
         return None
 
-    # Motion arrives as fixed-point (score * 256); None means "still warming up".
+    # Fixed-point (value * 256); MOTION_WARMING_UP means the baseline isn't ready.
     motion = None if motion_q8 == MOTION_WARMING_UP else motion_q8 / 256.0
+    excess = None if excess_q8 == MOTION_WARMING_UP else excess_q8 / 256.0
+    csi_floor = None if floor_q8 == MOTION_WARMING_UP else floor_q8 / 256.0
+    distance_m = None if distance_cm == DISTANCE_NO_TARGET else distance_cm / 100.0
 
     csi_bytes = data[HEADER_SIZE:]
     n_pairs = len(csi_bytes) // 2
@@ -74,6 +99,9 @@ def parse_packet(data: bytes):
         "rssi": rssi,
         "noise_floor": noise_floor,
         "motion": motion,
+        "excess": excess,
+        "csi_floor": csi_floor,
+        "distance_m": distance_m,
         "amplitudes": amplitudes,
         "phases": phases,
         "ts": time.time(),
@@ -89,57 +117,123 @@ class CSIProtocol(asyncio.DatagramProtocol):
         if frame is None:
             return
 
-        global latest_frame
+        # Keep this handler cheap: just record the newest frame and count it.
+        # Anything expensive (JSON, sockets, stdout) happens on the timers below,
+        # off the hot path.
+        global latest_frame, packets_received
         latest_frame = frame
+        frame["addr"] = addr[0]
+        packets_received += 1
+
+
+async def broadcast_loop():
+    """Push the newest frame to browsers at a fixed rate, not per packet."""
+    interval = 1.0 / BROADCAST_HZ
+    last_sent_seq = None
+
+    while True:
+        await asyncio.sleep(interval)
+        frame = latest_frame
+        if not frame or not clients:
+            continue
+        # Nothing new since the last tick (ESP32 offline or slower than us).
+        if frame["sequence"] == last_sent_seq:
+            continue
+        last_sent_seq = frame["sequence"]
 
         amps = frame["amplitudes"]
-        amp_min = min(amps) if amps else 0.0
-        amp_max = max(amps) if amps else 0.0
-        amp_mean = (sum(amps) / len(amps)) if amps else 0.0
-
         motion = frame["motion"]
-        motion_str = "  warmup" if motion is None else f"{motion:7.2f}"
-
-        print(
-            f"[{addr[0]}] seq={frame['sequence']:>8} node={frame['node_id']} "
-            f"sc={frame['num_subcarriers']:>4} rssi={frame['rssi']:>4}dBm "
-            f"noise={frame['noise_floor']:>4}dBm "
-            f"amp(min/mean/max)={amp_min:6.1f}/{amp_mean:6.1f}/{amp_max:6.1f} "
-            f"motion={motion_str}"
+        payload = json.dumps(
+            {
+                "sequence": frame["sequence"],
+                "node_id": frame["node_id"],
+                "rssi": frame["rssi"],
+                "noise_floor": frame["noise_floor"],
+                "num_subcarriers": frame["num_subcarriers"],
+                "amplitudes": amps,
+                "amp_mean": (sum(amps) / len(amps)) if amps else 0.0,
+                "motion": motion,
+                "excess": frame["excess"],
+                "csi_floor": frame["csi_floor"],
+                "distance_m": frame["distance_m"],
+                # Presence is judged on excess, not the raw score.
+                "presence": (
+                    frame["excess"] is not None
+                    and frame["excess"] >= MOTION_PRESENCE_THRESHOLD
+                ),
+                "motion_threshold": MOTION_PRESENCE_THRESHOLD,
+                "pps": packets_per_sec,
+            }
         )
 
-        self.loop.create_task(broadcast(frame))
+        dead = []
+        for ws in clients:
+            try:
+                await ws.send_str(payload)
+            except (ConnectionResetError, ConnectionError):
+                dead.append(ws)
+        for ws in dead:
+            clients.discard(ws)
 
 
-async def broadcast(frame: dict):
-    if not clients:
-        return
-    amps = frame["amplitudes"]
-    payload = json.dumps(
-        {
-            "sequence": frame["sequence"],
-            "node_id": frame["node_id"],
-            "rssi": frame["rssi"],
-            "noise_floor": frame["noise_floor"],
-            "num_subcarriers": frame["num_subcarriers"],
-            "amplitudes": amps,
-            "amp_mean": (sum(amps) / len(amps)) if amps else 0.0,
-            "motion": frame["motion"],
-            "presence": (
-                frame["motion"] is not None
-                and frame["motion"] >= MOTION_PRESENCE_THRESHOLD
-            ),
-            "motion_threshold": MOTION_PRESENCE_THRESHOLD,
-        }
-    )
-    dead = []
-    for ws in clients:
-        try:
-            await ws.send_str(payload)
-        except ConnectionResetError:
-            dead.append(ws)
-    for ws in dead:
-        clients.discard(ws)
+async def console_loop():
+    """Periodic one-line summary, including the true packet rate."""
+    global packets_per_sec, packets_received
+    interval = 1.0 / CONSOLE_LOG_HZ if CONSOLE_LOG_HZ else 1.0
+    prev_count = 0
+    prev_seq = None
+    lost_total = 0
+
+    while True:
+        await asyncio.sleep(interval)
+
+        seen = packets_received - prev_count
+        prev_count = packets_received
+        packets_per_sec = seen / interval
+
+        frame = latest_frame
+        if not frame:
+            continue
+
+        # Gaps in the sequence counter mean packets were lost in flight (Wi-Fi
+        # or the ESP32's own queue), which is the usual cause of a choppy graph.
+        seq = frame["sequence"]
+        if prev_seq is not None and seq > prev_seq:
+            gap = seq - prev_seq - seen
+            if gap > 0:
+                lost_total += gap
+        prev_seq = seq
+
+        if not CONSOLE_LOG_HZ:
+            continue
+
+        amps = frame["amplitudes"]
+        amp_mean = (sum(amps) / len(amps)) if amps else 0.0
+        motion = frame["motion"]
+        motion_str = "warmup" if motion is None else f"{motion:6.2f}"
+
+        print(
+            f"[{frame.get('addr', '?')}] seq={seq:>8} {packets_per_sec:5.1f} pkt/s "
+            f"sc={frame['num_subcarriers']:>4} rssi={frame['rssi']:>4}dBm "
+            f"amp_mean={amp_mean:6.1f} motion={motion_str} "
+            f"lost={lost_total} clients={len(clients)}"
+        )
+
+
+def lan_ip() -> str:
+    """Best-effort LAN address of this machine, for the ESP32 and other laptops.
+
+    Uses a UDP socket to a public address to pick the default-route interface;
+    no packets are actually sent. Falls back to localhost if there's no route.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "localhost"
+    finally:
+        s.close()
 
 
 async def index(_request: web.Request):
@@ -170,6 +264,7 @@ INDEX_HTML = """<!doctype html>
   .stat { background:#151923; border:1px solid #232838; border-radius:8px; padding:.6rem 1rem; min-width:110px; }
   .stat .label { font-size:.7rem; color:#8892a6; text-transform:uppercase; letter-spacing:.05em; }
   .stat .value { font-size:1.3rem; color:#e6e6e6; margin-top:.2rem; }
+  canvas#radar { height:260px; }
   canvas { background:#11141c; border:1px solid #232838; border-radius:8px; width:100%; height:220px; display:block; margin-bottom:1.2rem; }
   .status { font-size:.8rem; color:#8892a6; }
   .status.live { color:#5ee6a0; }
@@ -193,6 +288,8 @@ INDEX_HTML = """<!doctype html>
   <div class="stat"><div class="label">Subcarriers</div><div class="value" id="sc">-</div></div>
   <div class="stat"><div class="label">RSSI</div><div class="value" id="rssi">-</div></div>
   <div class="stat"><div class="label">Noise floor</div><div class="value" id="noise">-</div></div>
+  <div class="stat"><div class="label">Packet rate</div><div class="value" id="pps">-</div></div>
+  <div class="stat"><div class="label">Est. distance</div><div class="value" id="dist">-</div></div>
   <div class="stat presence" id="presenceCard">
     <div class="label">Motion / presence</div>
     <div class="value"><span id="motion">-</span> <span id="presence" style="font-size:.8rem;">&nbsp;</span></div>
@@ -203,7 +300,10 @@ INDEX_HTML = """<!doctype html>
 <div class="section-label">Amplitude per subcarrier</div>
 <canvas id="amp" height="220"></canvas>
 
-<div class="section-label">Motion score history &mdash; flat when still, spikes when a hand covers the board</div>
+<div class="section-label">Proximity &mdash; radius only; a single antenna carries no direction information</div>
+<canvas id="radar" height="260"></canvas>
+
+<div class="section-label">Excess over noise floor &mdash; flat when still, spikes when a hand covers the board</div>
 <canvas id="motionHist" height="220"></canvas>
 
 <div class="section-label">RSSI / mean amplitude history</div>
@@ -213,6 +313,7 @@ INDEX_HTML = """<!doctype html>
 const ampCanvas = document.getElementById('amp');
 const histCanvas = document.getElementById('hist');
 const motionCanvas = document.getElementById('motionHist');
+const radarCanvas = document.getElementById('radar');
 const statusEl = document.getElementById('status');
 
 function fitCanvas(c) {
@@ -220,8 +321,8 @@ function fitCanvas(c) {
   c.width = rect.width * devicePixelRatio;
   c.height = rect.height * devicePixelRatio;
 }
-window.addEventListener('resize', () => { fitCanvas(ampCanvas); fitCanvas(histCanvas); fitCanvas(motionCanvas); });
-fitCanvas(ampCanvas); fitCanvas(histCanvas); fitCanvas(motionCanvas);
+window.addEventListener('resize', () => { fitCanvas(ampCanvas); fitCanvas(histCanvas); fitCanvas(motionCanvas); fitCanvas(radarCanvas); });
+fitCanvas(ampCanvas); fitCanvas(histCanvas); fitCanvas(motionCanvas); fitCanvas(radarCanvas);
 
 const rssiHistory = [];
 const ampHistory = [];
@@ -245,6 +346,57 @@ function drawAmplitudes(amps) {
     ctx.fillStyle = `hsl(${hue}, 80%, 60%)`;
     ctx.fillRect(i * barW, h - barH, Math.max(barW - 1, 1), barH);
   }
+}
+
+// Proximity ring. Deliberately a full circle, not a blip: one antenna gives
+// range-like information only, so drawing a direction would be a fiction.
+const MAX_RADIUS_M = 4.0;
+function drawRadar(distM) {
+  const ctx = radarCanvas.getContext('2d');
+  const w = radarCanvas.width, h = radarCanvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const cx = w / 2, cy = h / 2;
+  const maxR = Math.min(w, h) / 2 - 24 * devicePixelRatio;
+
+  // Range rings, labelled in metres.
+  ctx.font = `${10 * devicePixelRatio}px ui-monospace, monospace`;
+  for (let m = 1; m <= MAX_RADIUS_M; m++) {
+    const r = (m / MAX_RADIUS_M) * maxR;
+    ctx.strokeStyle = '#232838';
+    ctx.lineWidth = 1 * devicePixelRatio;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = '#4a5164';
+    ctx.fillText(m + 'm', cx + r - 12 * devicePixelRatio, cy - 3 * devicePixelRatio);
+  }
+
+  // The node itself.
+  ctx.fillStyle = '#9fd3ff';
+  ctx.beginPath(); ctx.arc(cx, cy, 4 * devicePixelRatio, 0, Math.PI * 2); ctx.fill();
+
+  if (distM === null || distM === undefined) {
+    ctx.fillStyle = '#4a5164';
+    ctx.font = `${12 * devicePixelRatio}px ui-monospace, monospace`;
+    ctx.fillText('no target', cx - 26 * devicePixelRatio, cy + 18 * devicePixelRatio);
+    return;
+  }
+
+  // Detection annulus: the target is somewhere on this ring, at unknown bearing.
+  const r = Math.min(distM / MAX_RADIUS_M, 1) * maxR;
+  const band = 14 * devicePixelRatio;
+  const grad = ctx.createRadialGradient(cx, cy, Math.max(r - band, 0), cx, cy, r + band);
+  grad.addColorStop(0, 'rgba(255,183,101,0)');
+  grad.addColorStop(0.5, 'rgba(255,183,101,0.55)');
+  grad.addColorStop(1, 'rgba(255,183,101,0)');
+  ctx.fillStyle = grad;
+  ctx.beginPath(); ctx.arc(cx, cy, r + band, 0, Math.PI * 2); ctx.fill();
+
+  ctx.strokeStyle = '#ffb765';
+  ctx.lineWidth = 2 * devicePixelRatio;
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+
+  ctx.fillStyle = '#ffb765';
+  ctx.font = `${12 * devicePixelRatio}px ui-monospace, monospace`;
+  ctx.fillText('~' + distM.toFixed(2) + ' m', cx - 24 * devicePixelRatio, cy + 18 * devicePixelRatio);
 }
 
 function drawMotionHistory() {
@@ -330,8 +482,20 @@ function connect() {
     setTimeout(connect, 1000);
   };
 
-  ws.onmessage = (ev) => {
-    const f = JSON.parse(ev.data);
+  // Store the frame and let requestAnimationFrame do the drawing. Rendering
+  // inside onmessage means the canvases redraw as fast as messages arrive,
+  // which is what makes the page feel laggy.
+  ws.onmessage = (ev) => { pendingFrame = JSON.parse(ev.data); };
+}
+
+let pendingFrame = null;
+
+function render() {
+  requestAnimationFrame(render);
+  const f = pendingFrame;
+  if (!f) return;
+  pendingFrame = null;
+  {
     document.getElementById('seq').textContent = f.sequence;
     document.getElementById('node').textContent = f.node_id;
     document.getElementById('sc').textContent = f.num_subcarriers;
@@ -345,23 +509,31 @@ function connect() {
     const cardEl = document.getElementById('presenceCard');
     const fillEl = document.getElementById('motionFill');
 
-    if (f.motion === null || f.motion === undefined) {
-      // Firmware is still building its amplitude baseline.
+    // Display EXCESS (motion above the learned noise floor), not the raw score:
+    // the raw idle level varies by environment so it isn't comparable.
+    const distEl = document.getElementById('dist');
+    if (f.excess === null || f.excess === undefined) {
       motionEl.textContent = '--';
       presenceEl.textContent = 'warming up';
+      distEl.textContent = '-';
       cardEl.classList.remove('on');
       fillEl.classList.remove('on');
       fillEl.style.width = '0%';
+      drawRadar(null);
     } else {
-      motionEl.textContent = f.motion.toFixed(1);
+      motionEl.textContent = f.excess.toFixed(1);
       presenceEl.textContent = f.presence ? 'PRESENCE' : 'clear';
       cardEl.classList.toggle('on', !!f.presence);
       fillEl.classList.toggle('on', !!f.presence);
-      fillEl.style.width = Math.min(100, (f.motion / MOTION_FULL_SCALE) * 100) + '%';
+      fillEl.style.width = Math.min(100, (f.excess / MOTION_FULL_SCALE) * 100) + '%';
 
-      motionHistory.push(f.motion);
+      distEl.textContent = (f.distance_m === null || f.distance_m === undefined)
+        ? 'no target' : '~' + f.distance_m.toFixed(2) + ' m';
+
+      motionHistory.push(f.excess);
       if (motionHistory.length > HISTORY_LEN) motionHistory.shift();
       drawMotionHistory();
+      drawRadar(f.distance_m);
     }
 
     drawAmplitudes(f.amplitudes);
@@ -371,9 +543,12 @@ function connect() {
     if (rssiHistory.length > HISTORY_LEN) rssiHistory.shift();
     if (ampHistory.length > HISTORY_LEN) ampHistory.shift();
     drawHistory();
-  };
+
+    if (f.pps !== undefined) document.getElementById('pps').textContent = f.pps.toFixed(0) + '/s';
+  }
 }
 connect();
+render();
 </script>
 </body>
 </html>
@@ -403,12 +578,21 @@ async def main():
         local_addr=(args.udp_host, args.udp_port),
     )
 
+    tasks = [
+        asyncio.create_task(broadcast_loop()),
+        asyncio.create_task(console_loop()),
+    ]
+
     print(f"UDP listening on {args.udp_host}:{args.udp_port}")
-    print(f"Web viewer at    http://{args.http_host if args.http_host != '0.0.0.0' else 'localhost'}:{args.http_port}")
+    print(f"Web viewer at    http://{lan_ip()}:{args.http_port}")
+    print(f"Broadcasting to browsers at {BROADCAST_HZ} Hz")
+    print("Point the ESP32's CSI_TARGET_IP at this machine's LAN address above.")
 
     try:
         await asyncio.Event().wait()
     finally:
+        for t in tasks:
+            t.cancel()
         transport.close()
         await runner.cleanup()
 
