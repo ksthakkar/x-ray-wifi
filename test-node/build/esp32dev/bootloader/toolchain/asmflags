@@ -1,0 +1,6 @@
+"-specs=C:/Users/Karan/Documents/PlatformIO/Projects/esp32-csi-node/.pio/build/esp32dev/bootloader/specs/picolibc.specs"
+-Wno-frame-address
+-mlongcalls
+-fno-builtin-memcpy
+-fno-builtin-memset
+-fno-builtin-bzero
