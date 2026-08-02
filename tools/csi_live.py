@@ -27,10 +27,12 @@ deviation from that baseline.
 import argparse
 import asyncio
 import json
+import logging
 import math
 import socket
 import struct
 import time
+import traceback
 
 from aiohttp import web
 
@@ -52,6 +54,25 @@ SMOOTH_ALPHA = 0.3         # light smoothing of the per-node amplitude profile
 
 clients = set()
 nodes = {}                 # node_id -> NodeState
+_bad_magic = 0
+
+# Debug log. Browser-side errors are POSTed here too, because a JS exception
+# blanks the page and takes its own console with it -- exactly the failure that
+# made the canvas growth bug hard to see.
+log = logging.getLogger("csi_live")
+
+
+def setup_logging(path, verbose):
+    log.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(path, mode="w")
+    fh.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)s %(message)s",
+                                      datefmt="%H:%M:%S"))
+    log.addHandler(fh)
+    if verbose:
+        sh = logging.StreamHandler()
+        sh.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        log.addHandler(sh)
+    log.info("=== csi_live start ===")
 
 
 class NodeState:
@@ -164,6 +185,11 @@ class CSIProtocol(asyncio.DatagramProtocol):
             return
         vals = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
         if vals[0] != MAGIC:
+            global _bad_magic
+            _bad_magic += 1
+            if _bad_magic in (1, 100, 1000):
+                log.warning("bad magic 0x%08X from %s (%d so far) -- stale "
+                            "firmware?", vals[0], addr[0], _bad_magic)
             return
         hdr = dict(zip(HEADER_FIELDS, vals))
         if hdr["rx_state"]:
@@ -172,16 +198,43 @@ class CSIProtocol(asyncio.DatagramProtocol):
         if nid not in nodes:
             nodes[nid] = NodeState(nid)
             print(f"[+] node {nid} appeared ({addr[0]})")
-        nodes[nid].update(hdr, data[HEADER_SIZE:])
+            log.info("node %d first frame from %s: sc=%d rssi=%d ch=%d "
+                     "sig_mode=%d rate=%d len=%d",
+                     nid, addr[0], hdr["num_subcarriers"], hdr["rssi"],
+                     hdr["channel"], hdr["sig_mode"], hdr["rate"],
+                     len(data) - HEADER_SIZE)
+        try:
+            nodes[nid].update(hdr, data[HEADER_SIZE:])
+        except Exception:
+            log.error("update() failed for node %d: %s", nid, traceback.format_exc())
 
 
 async def rate_loop():
-    """Recompute per-node frame rate once a second."""
+    """Recompute per-node frame rate once a second, and log state."""
+    tick = 0
     while True:
         await asyncio.sleep(1.0)
+        tick += 1
         for ns in nodes.values():
             ns.rate = ns.frames - ns.prev_frames
             ns.prev_frames = ns.frames
+        if nodes:
+            log.debug("state: " + " | ".join(
+                f"n{ns.nid} {ns.rate:.0f}/s dev={ns.deviation:.4f} "
+                f"rssi={ns.rssi} sc={ns.n_sc} lost={ns.lost} "
+                f"skipped={ns.other_width} ref={'y' if ns.reference else 'n'}"
+                for ns in (nodes[k] for k in sorted(nodes))))
+        # Every 15 s, record the deviation distribution: this is what tells you
+        # whether an apparent spike is out of family or just normal variation.
+        if tick % 15 == 0:
+            for ns in (nodes[k] for k in sorted(nodes)):
+                h = ns.dev_history
+                if h:
+                    sh = sorted(h)
+                    log.info("n%d dev over last %d samples: min=%.4f p50=%.4f "
+                             "p95=%.4f max=%.4f",
+                             ns.nid, len(h), sh[0], sh[len(sh)//2],
+                             sh[int(len(sh)*0.95)], sh[-1])
 
 
 async def broadcast_loop():
@@ -203,6 +256,22 @@ async def broadcast_loop():
 
 async def index(_req):
     return web.Response(text=INDEX_HTML, content_type="text/html")
+
+
+async def clientlog(request):
+    """Receive browser-side errors.
+
+    A JS exception blanks the page and its console with it, so the browser must
+    report failures to the server to be diagnosable at all.
+    """
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        return web.Response(text="bad json", status=400)
+    lvl = body.get("level", "error")
+    msg = str(body.get("msg", ""))[:2000]
+    getattr(log, "error" if lvl == "error" else "info")("BROWSER: %s", msg)
+    return web.Response(text="ok")
 
 
 async def ws_handler(request):
@@ -257,7 +326,14 @@ INDEX_HTML = """<!doctype html>
  .meta{font-size:.7rem;color:#8892a6}
  .dev{font-size:1.5rem;margin:.2rem 0}
  .node.alert .dev{color:#ffb765}
- canvas{display:block;width:100%;background:#11141c;border-radius:5px;margin-top:.35rem}
+ /* Explicit CSS height is REQUIRED. Without it, assigning canvas.height in JS
+    changes the element's layout size, which feeds back into getBoundingClientRect
+    on the next frame -- the canvas grows without bound and the tab runs out of
+    memory (observed as the trace "climbing to infinity" then a white page). */
+ canvas{display:block;width:100%;background:#11141c;border-radius:5px;
+        margin-top:.35rem}
+ canvas.amp{height:90px}
+ canvas.hist{height:60px}
  .lbl{font-size:.65rem;color:#6b7488;text-transform:uppercase;letter-spacing:.04em;
       margin-top:.45rem}
 </style></head><body>
@@ -283,6 +359,22 @@ const els={};
 
 function send(m){ if(ws&&ws.readyState===1) ws.send(m); }
 
+function report(level,msg){
+  try{ fetch('/clientlog',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({level:level,msg:String(msg)})}); }catch(e){}
+}
+window.onerror=(m,src,ln,col,err)=>{
+  report('error',`${m} @${src}:${ln}:${col} ${err&&err.stack?err.stack:''}`);};
+window.onunhandledrejection=e=>report('error','unhandled rejection: '+e.reason);
+// Canvas growth bug guard: if a panel's canvas ever exceeds its CSS box, say so
+// loudly instead of silently consuming memory.
+function checkSize(c,label){
+  const r=c.getBoundingClientRect();
+  if(r.height>400){ report('error',`${label} canvas height ${r.height}px -- `+
+    'layout feedback loop'); return false; }
+  return true;
+}
+
 function ensure(nid){
   if(els[nid]) return els[nid];
   const d=document.createElement('div'); d.className='node';
@@ -290,18 +382,23 @@ function ensure(nid){
       <span class="meta" id="m${nid}"></span></div>
     <div class="dev" id="d${nid}">--</div>
     <div class="lbl">amplitude per subcarrier (grey = frozen reference)</div>
-    <canvas id="a${nid}" height="90"></canvas>
+    <canvas id="a${nid}" class="amp"></canvas>
     <div class="lbl">deviation history</div>
-    <canvas id="h${nid}" height="60"></canvas>`;
+    <canvas id="h${nid}" class="hist"></canvas>`;
   grid.appendChild(d);
   els[nid]={root:d, meta:d.querySelector('#m'+nid), dev:d.querySelector('#d'+nid),
             amp:d.querySelector('#a'+nid), hist:d.querySelector('#h'+nid)};
   return els[nid];
 }
 
-function fit(c){const r=c.getBoundingClientRect();
-  if(c.width!==r.width*devicePixelRatio){c.width=r.width*devicePixelRatio;
-  c.height=parseInt(c.getAttribute('height'))*devicePixelRatio;}}
+function fit(c){
+  const r=c.getBoundingClientRect();
+  const dpr=Math.min(devicePixelRatio||1,2);
+  // Clamp: a runaway layout must never be able to allocate an enormous buffer.
+  const w=Math.max(1,Math.min(Math.round(r.width*dpr),4096));
+  const h=Math.max(1,Math.min(Math.round(r.height*dpr),1024));
+  if(c.width!==w||c.height!==h){c.width=w;c.height=h;}
+  return true;}
 
 function drawAmps(c,amps,ref){
   fit(c); const x=c.getContext('2d'),w=c.width,h=c.height;
@@ -334,9 +431,16 @@ function drawHist(c,hist){
   x.fillText(mx.toFixed(2),3*devicePixelRatio,11*devicePixelRatio);
 }
 
+let renderErrors=0;
 function render(){
   requestAnimationFrame(render);
   if(!pending) return; const data=pending; pending=null;
+  try{ draw(data); }catch(e){
+    if(++renderErrors<=3) report('error','render: '+(e&&e.stack?e.stack:e));
+  }
+}
+
+function draw(data){
   for(const n of data.nodes){
     const e=ensure(n.node_id);
     e.root.classList.toggle('stale',n.stale);
@@ -346,8 +450,8 @@ function render(){
     e.meta.textContent=`${n.rate}/s  ${n.rssi}dBm  ${n.n_sc}sc  lost ${n.lost}`
       + (n.other_width ? `  skipped ${n.other_width}` : '');
     e.dev.textContent = n.has_ref ? dev.toFixed(3) : 'no ref';
-    drawAmps(e.amp,n.amps,n.reference);
-    drawHist(e.hist,n.dev_history);
+    if(checkSize(e.amp,'amp')) drawAmps(e.amp,n.amps,n.reference);
+    if(checkSize(e.hist,'hist')) drawHist(e.hist,n.dev_history);
   }
 }
 
@@ -358,6 +462,34 @@ function connect(){
   ws.onmessage=e=>{pending=JSON.parse(e.data);};
 }
 connect(); render();
+
+// Watchdog. A white page is the tab running out of memory, and it takes its own
+// console with it, so growth has to be reported to the server as it happens
+// rather than inspected afterwards.
+let wdPrev=null;
+setInterval(()=>{
+  try{
+    const canvases=document.querySelectorAll('canvas');
+    let px=0, maxh=0;
+    canvases.forEach(c=>{ px+=c.width*c.height; maxh=Math.max(maxh,c.height);
+      const r=c.getBoundingClientRect(); maxh=Math.max(maxh,r.height); });
+    const cur={ nodes:Object.keys(els).length, canvases:canvases.length,
+                px:px, maxh:Math.round(maxh),
+                heap: performance.memory ?
+                      Math.round(performance.memory.usedJSHeapSize/1048576) : -1,
+                docNodes: document.querySelectorAll('*').length };
+    // Only report when something is actually growing, to keep the log readable.
+    if(wdPrev){
+      const grew = cur.canvases>wdPrev.canvases || cur.px>wdPrev.px*1.2
+                || cur.docNodes>wdPrev.docNodes || cur.maxh>wdPrev.maxh
+                || (cur.heap>0 && cur.heap>wdPrev.heap+20);
+      if(grew) report('info','GROWTH '+JSON.stringify(wdPrev)+' -> '+JSON.stringify(cur));
+    } else {
+      report('info','baseline '+JSON.stringify(cur));
+    }
+    wdPrev=cur;
+  }catch(e){ report('error','watchdog: '+e); }
+}, 3000);
 </script></body></html>
 """
 
@@ -369,12 +501,18 @@ async def main():
     ap.add_argument("--udp-port", type=int, default=5005)
     ap.add_argument("--http-host", default="0.0.0.0")
     ap.add_argument("--http-port", type=int, default=8080)
+    ap.add_argument("--log", default="csi_live.log", help="debug log file")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="also print debug lines to the console")
     args = ap.parse_args()
+
+    setup_logging(args.log, args.verbose)
 
     loop = asyncio.get_running_loop()
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
+    app.router.add_post("/clientlog", clientlog)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, args.http_host, args.http_port).start()
@@ -383,6 +521,7 @@ async def main():
         CSIProtocol, local_addr=(args.udp_host, args.udp_port))
 
     tasks = [asyncio.create_task(broadcast_loop()), asyncio.create_task(rate_loop())]
+    print(f"debug log -> {args.log}")
     print(f"UDP  listening on {args.udp_host}:{args.udp_port}")
     print(f"View at http://{lan_ip()}:{args.http_port}")
     print("Point every receiver's CSI_TARGET_IP at that address.")
