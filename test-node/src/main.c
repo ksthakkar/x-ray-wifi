@@ -60,9 +60,17 @@ static const float DIST_MAX_RADIUS_M = 4.0f;  // reported when excess ~ 0
 static const float DIST_EXCESS_NEAR = 25.0f;  // excess that maps to 0 m
 static const float DIST_EXCESS_MIN = 2.0f;    // below this: "no target"
 
+// Each physical node needs a distinct NODE_ID so the viewer can tell their
+// packets apart. Defined per-node in credentials.h; defaults to 1 so existing
+// single-node credentials.h files (written before CSI_NODE_ID existed) still
+// build unchanged.
+#ifndef CSI_NODE_ID
+#define CSI_NODE_ID 1
+#endif
+
 static const char *TARGET_IP = CSI_TARGET_IP;
 static const uint16_t TARGET_PORT = CSI_TARGET_PORT;
-static const uint8_t NODE_ID = 1;
+static const uint8_t NODE_ID = CSI_NODE_ID;
 static const uint32_t ADR018_MAGIC = 0xC5110001;
 static const uint8_t NUM_ANTENNAS = 1;
 static const uint32_t WIFI_CHANNEL_FREQ_MHZ = 2412; // channel 1, 2.4 GHz

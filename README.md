@@ -70,10 +70,16 @@ Edit `test-node/src/credentials.h`:
 
 #define CSI_TARGET_IP "192.168.1.100"   // your laptop's LAN IP
 #define CSI_TARGET_PORT 5005
+
+#define CSI_NODE_ID 1                   // unique per physical node
 ```
 
 Find your laptop's LAN IP with `ipconfig` (Windows) and make sure it's the
 address on the same network the ESP32 will join, not a VPN/virtual adapter.
+
+`CSI_NODE_ID` only matters once you have more than one ESP32 running at the
+same time (see "Running multiple nodes" below) — the viewer uses it to tell
+nodes' streams apart. With a single node the default `1` is fine.
 
 `credentials.h` is listed in `test-node/.gitignore` and will never be
 committed — only `credentials.h.example` is tracked.
@@ -184,6 +190,43 @@ This covers visualization and collection only. Per `CLAUDE.md`, the UNO Q is
 also meant to eventually own fusion and inference across multiple nodes —
 that pipeline doesn't exist yet; this is just the wiring that gets CSI data
 onto the UNO Q in the first place.
+
+## Running multiple nodes
+
+`csi_viewer.py` and the firmware both key everything off `node_id`, so
+running a second (or third, ...) ESP32 alongside the first just means
+repeating the setup with a distinct `CSI_NODE_ID` per board. No viewer code
+changes needed — the dashboard builds one panel per node it hears from,
+automatically, the first time that node's packets arrive:
+
+1. For **each additional ESP32**, use its own `test-node/src/credentials.h`
+   (per-board — the file lives on the machine you flash from, so if you
+   flash both boards from the same laptop, edit and reflash between boards):
+   ```c
+   #define CSI_NODE_ID 2   // 1 for the first board, 2 for the second, etc.
+   ```
+   Keep `CSI_TARGET_IP`/`CSI_TARGET_PORT` the same for every node — they all
+   send to the same viewer/UNO Q.
+2. Flash each board following step 2 above, one at a time (swap
+   `credentials.h`'s `CSI_NODE_ID` between flashes if you're flashing from
+   one laptop with one `credentials.h`).
+3. Power all nodes on. They send independently and don't need to know about
+   each other.
+4. Start (or leave running) a single `csi_viewer.py` instance — it listens
+   on one UDP port and demuxes incoming packets by `node_id`. The dashboard
+   at `http://<host>:8080` shows one full panel (amplitude, motion, distance,
+   proximity ring) per node, added automatically as each node's first packet
+   arrives, and a "Nodes seen" counter at the top.
+
+Above the per-node panels, a "Fused presence" summary combines all nodes'
+readings into one confidence number: presence is only declared when a
+majority of currently-calibrated nodes individually agree, which filters out
+a single node's spurious excess spike (draft, reflection) reading as a
+person. This uses no node position data — it's agreement voting, not
+localization. There's no position fusion across nodes yet — combining
+multiple nodes' readings into a single (x, y) position estimate is exactly
+the "Per-node encoding + fusion" stage `CLAUDE.md` describes, and isn't
+implemented in this repo yet.
 
 ## Interpreting what you see
 
