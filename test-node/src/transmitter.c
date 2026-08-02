@@ -151,7 +151,27 @@ void app_main(void)
     // means the transmitter works with no router present at all.
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_channel(CSI_CHANNEL, WIFI_SECOND_CHAN_NONE));
+
+    // The ESP32-C3 radio is 2.4 GHz only: valid channels are 1-14. A 5 GHz
+    // channel number (36, 100, 149, ...) is rejected with ESP_ERR_INVALID_ARG.
+    // Check before calling so this reports the actual mistake instead of an
+    // ESP_ERROR_CHECK abort loop.
+#if (CSI_CHANNEL < 1) || (CSI_CHANNEL > 14)
+#error "CSI_CHANNEL must be 1-14. ESP32 Wi-Fi is 2.4 GHz only; 5 GHz channels \
+(36/40/.../100/149) are not supported. If your router runs 5 GHz, use its 2.4 GHz \
+band (or any free 2.4 GHz channel -- the transmitter does not need a router)."
+#endif
+
+    esp_err_t rc = esp_wifi_set_channel(CSI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    if (rc != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_set_channel(%u) failed: %s",
+                 (unsigned)CSI_CHANNEL, esp_err_to_name(rc));
+        ESP_LOGE(TAG, "Valid 2.4 GHz channels are 1-14. Rebuild with "
+                      "-DCSI_CHANNEL=<1-14>.");
+        return; // no point beaconing on the wrong channel
+    }
+
     esp_wifi_set_ps(WIFI_PS_NONE); // never sleep: a gap in the beacon is a gap in data
 
     ESP_ERROR_CHECK(esp_now_init());
