@@ -1,0 +1,86 @@
+PS C:\Users\zpest\dev\x-ray-wifi\test-node> pio run -e tx-esp32-c3 -t upload --upload-port COM9
+Processing tx-esp32-c3 (platform: espressif32; board: esp32-c3-devkitm-1; framework: espidf)
+--------------------------------------------------------------------------------------------------------
+Verbose mode can be enabled via `-v, --verbose` option
+CONFIGURATION: https://docs.platformio.org/page/boards/espressif32/esp32-c3-devkitm-1.html
+PLATFORM: Espressif 32 (7.0.1) > Espressif ESP32-C3-DevKitM-1
+HARDWARE: ESP32C3 160MHz, 320KB RAM, 4MB Flash
+DEBUG: Current (cmsis-dap) External (cmsis-dap, esp-bridge, esp-builtin, esp-prog, iot-bus-jtag, jlink, minimodule, olimex-arm-usb-ocd, olimex-arm-usb-ocd-h, olimex-arm-usb-tiny-h, olimex-jtag-tiny, tumpa)
+PACKAGES: 
+ - framework-espidf @ 4.60001.0 (6.0.1) 
+ - tool-cmake @ 3.30.2 
+ - tool-esp-rom-elfs @ 0.0.1+20241011 
+ - tool-esptoolpy @ 2.41100.0 (4.11.0) 
+ - tool-idf @ 1.0.1 
+ - tool-mconf @ 1.4060000.20190628 (406.0.0) 
+ - tool-mkfatfs @ 2.0.1 
+ - tool-mklittlefs @ 1.203.210628 (2.3) 
+ - tool-mkspiffs @ 2.230.0 (2.30) 
+ - tool-ninja @ 1.9.0 
+ - tool-riscv32-esp-elf-gdb @ 11.2.0+20220823 
+ - tool-xtensa-esp-elf-gdb @ 11.2.0+20230208 
+ - toolchain-esp32ulp @ 1.23800.240113 (2.38.0) 
+ - toolchain-riscv32-esp @ 15.2.0+20251204
+Reading CMake configuration...
+Generating assembly for certificate bundle...
+Warning! Flash memory size mismatch detected. Expected 4MB, found 2MB!
+Please select a proper value in your `sdkconfig.defaults` or via the `menuconfig` target!
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+LDF Modes: Finder ~ chain, Compatibility ~ soft
+Found 0 compatible libraries
+Scanning dependencies...
+No dependencies
+Building in release mode
+Compiling .pio\build\tx-esp32-c3\src\main.c.o
+Compiling .pio\build\tx-esp32-c3\src\transmitter.c.o
+Preprocessing linker script .pio\build\tx-esp32-c3\memory.ld
+Preprocessing linker script .pio\build\tx-esp32-c3\esp-idf\esp_system\ld\sections.ld.in
+Compiling .pio\build\tx-esp32-c3\__pio_env\__dummy.S.o
+Compiling .pio\build\tx-esp32-c3\__pio_env\__dummy.c.o
+Compiling .pio\build\tx-esp32-c3\__pio_env\__dummy.cpp.o
+Compiling .pio\build\tx-esp32-c3\app_update\esp_ota_ops.c.o
+Compiling .pio\build\tx-esp32-c3\bootloader_support\src\bootloader_common.c.o
+Compiling .pio\build\tx-esp32-c3\bootloader_support\src\bootloader_common_loader.c.o
+Archiving .pio\build\tx-esp32-c3\esp-idf\__pio_env\lib__pio_env.a
+Compiling .pio\build\tx-esp32-c3\bootloader_support\src\bootloader_clock_init.c.o
+Compiling .pio\build\tx-esp32-c3\bootloader_support\src\bootloader_mem.c.o
+Compiling .pio\build\tx-esp32-c3\bootloader_support\src\bootloader_random.c.o
+Compiling .pio\build\tx-esp32-c3\bootloader_support\src\bootloader_efuse.c.o
+Compiling .pio\build\tx-esp32-c3\bootloader_support\src\flash_encrypt.c.o
+Compiling .pio\build\tx-esp32-c3\bootloader_support\src\secure_boot.c.o
+Compiling .pio\build\tx-esp32-c3\bootloader_support\src\bootloader_random_esp32c3.c.o
+In file included from C:/Users/zpest/.platformio/packages/framework-espidf/components/esp_hw_support/include/esp_intr_alloc.h:12,                                                                               
+                 from C:/Users/zpest/.platformio/packages/framework-espidf/components/esp_hw_support/include/esp_cpu.h:21,                                                                                      
+                 from C:/Users/zpest/.platformio/packages/framework-espidf/components/esp_hw_support/include/spinlock.h:11,                                                                                     
+                 from C:/Users/zpest/.platformio/packages/framework-espidf/components/freertos/FreeRTOS-Kernel/portable/riscv/include/freertos/portmacro.h:68,                                                  
+                 from C:/Users/zpest/.platformio/packages/framework-espidf/components/freertos/FreeRTOS-Kernel/include/freertos/portable.h:57,                                                                  
+                 from C:/Users/zpest/.platformio/packages/framework-espidf/components/freertos/FreeRTOS-Kernel/include/freertos/FreeRTOS.h:69,                                                                  
+                 from src/transmitter.c:36:                                                             
+src/transmitter.c: In function 'app_main':                                                              
+src/transmitter.c:136:46: error: passing argument 1 of 'esp_now_register_send_cb' from incompatible pointer type [-Wincompatible-pointer-types]                                                                 
+  136 |     ESP_ERROR_CHECK(esp_now_register_send_cb(on_send));                                         
+      |                                              ^~~~~~~                                            
+      |                                              |                                                  
+      |                                              void (*)(const uint8_t *, esp_now_send_status_t) {aka void (*)(const unsigned char *, esp_now_send_status_t)}                                              
+C:/Users/zpest/.platformio/packages/framework-espidf/components/esp_common/include/esp_err.h:116:30: note: in definition of macro 'ESP_ERROR_CHECK'                                                             
+  116 |         esp_err_t err_rc_ = (x);                                        \                       
+      |                              ^                                                                  
+In file included from src/transmitter.c:41:                                                             
+Compiling .pio\build\tx-esp32-c3\bootloader_support\bootloader_flash\src\bootloader_flash.c.o
+C:/Users/zpest/.platformio/packages/framework-espidf/components/esp_wifi/include/esp_now.h:193:54: note: expected 'esp_now_send_cb_t' {aka 'void (*)(const wifi_tx_info_t *, esp_now_send_status_t)'} but argument is of type 'void (*)(const uint8_t *, esp_now_send_status_t)' {aka 'void (*)(const unsigned char *, esp_now_send_status_t)'}                                                                                 
+  193 | esp_err_t esp_now_register_send_cb(esp_now_send_cb_t cb);                                       
+      |                                    ~~~~~~~~~~~~~~~~~~^~                                         
+src/transmitter.c:78:13: note: 'on_send' declared here                                                  
+   78 | static void on_send(const uint8_t *mac, esp_now_send_status_t status)                           
+      |             ^~~~~~~                                                                             
+C:/Users/zpest/.platformio/packages/framework-espidf/components/esp_wifi/include/esp_now.h:127:16: note: 'esp_now_send_cb_t' declared here                                                                      
+  127 | typedef void (*esp_now_send_cb_t)(const esp_now_send_info_t *tx_info, esp_now_send_status_t status);
+      |                ^~~~~~~~~~~~~~~~~                                                                
+*** [.pio\build\tx-esp32-c3\src\transmitter.c.o] Error 1
+===================================== [FAILED] Took 44.35 seconds =====================================
+
+Environment    Status    Duration
+-------------  --------  ------------
+tx-esp32-c3    FAILED    00:00:44.346
+================================ 1 failed, 0 succeeded in 00:00:44.346 ================================
+PS C:\Users\zpest\dev\x-ray-wifi\test-node> 
