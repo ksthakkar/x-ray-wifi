@@ -1,0 +1,18 @@
+{
+  "site": "lab-partition-a",
+  "wall": {
+    "width_m": 3.6,
+    "height_m": 2.4,
+    "y_m": 0.0
+  },
+  "display": {
+    "viewer_position_m": [1.8, -2.0, 1.65],
+    "yaw_deg": 0.0,
+    "pitch_deg": 0.0,
+    "horizontal_fov_deg": 50.0,
+    "torso_height_m": 1.2,
+    "presence_threshold": 0.5,
+    "stale_after_ms": 1000,
+    "show_wall_grid": true
+  }
+}

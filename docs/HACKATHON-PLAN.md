@@ -59,6 +59,12 @@ works, the demo is a single self-contained board driving AR glasses, which is
 a far better story. If it doesn't, use a laptop for display and keep the
 UNO Q as the compute node. Decide this on day 0, not on demo morning.
 
+This is a fixed-view MVP, not free-walking AR. Mark one viewer position on the
+floor. The wearer may rotate their head because the One Pro supplies native
+3DoF Anchor mode, but must not translate away from that mark. Translation
+requires a separate 6DoF wearer pose; an IMU alone cannot provide drift-free
+position.
+
 ---
 
 ## Day 1 — Plumbing
@@ -149,7 +155,9 @@ better with 0.5 s of smoothing. Do not over-smooth — lag is more noticeable
 than jitter.
 
 **End of day 3:** the hub emits the [`ARCHITECTURE.md` §4.4](ARCHITECTURE.md)
-estimate JSON over WebSocket, and the position tracks a walking person.
+estimate JSON at 10 Hz over `/ws/estimates`, and the position tracks a walking
+person. `tools/fake_hub.py` can run the same server and schema before live
+inference exists.
 
 ---
 
@@ -182,6 +190,15 @@ explaining the system to onlookers).
 
 Build against `tools/fake_hub.py` emitting synthetic estimates so display
 work never blocks on sensing.
+
+For first-person calibration, stand on the marked viewer point, enter Anchor
+mode, long-press the glasses' X button to recenter toward the wall, then press
+`C` in the display. Align the projected grid with known wall edges using the
+arrow keys and `+`/`-`; the browser stores these display-only yaw, pitch, and
+field-of-view offsets. `H` toggles diagnostics and `F` requests fullscreen.
+
+Keep the illuminator fixed. Carrying it with the wearer would change the RF
+geometry and invalidate the empty-room baseline and fingerprint library.
 
 **End of day 4:** wearer puts on the glasses, someone walks behind the wall,
 the marker follows.
@@ -241,3 +258,8 @@ Deferred to [`ARCHITECTURE.md`](ARCHITECTURE.md), not abandoned:
 Everything built in this plan — wire format, site config, DSP pipeline,
 session recorder, feature extraction, estimate schema, display — is used
 unchanged by the full architecture. None of it is throwaway.
+
+The final free-walking client adds XREAL Eye pose tracking on a supported
+Unity host. It transforms the same wall-frame estimates into the moving
+wearer's view; it does not move the RF coordinate origin or require the UNO Q
+to infer wearer motion from the glasses' IMU.

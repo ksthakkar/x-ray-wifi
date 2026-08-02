@@ -233,7 +233,10 @@ capture:
 
 ### 4.4 Hub → AR client: estimate stream
 
-WebSocket, JSON, one message per inference tick (target 10 Hz).
+WebSocket at `/ws/estimates`, JSON, one message per inference tick (target
+10 Hz). The hub retains the latest valid estimate and sends it immediately
+to a newly connected client. Invalid estimates are rejected before broadcast;
+`GET /healthz` reports client count, latest-estimate age, and rejection count.
 
 ```json
 {
@@ -645,6 +648,20 @@ What it cannot do is world-lock content — the marker is fixed relative to the
 virtual screen, not to the room. With the wearer standing at a marked
 position facing the wall, that difference is not visible.
 
+The fixed-view client treats that marked position as a calibrated virtual
+camera in `W`. The site config records the viewer position, yaw, pitch,
+effective display field of view, and default torso height. The client projects
+the hub's unchanged wall-frame estimate through that camera. Depth therefore
+changes apparent lateral displacement and marker size correctly for the
+marked viewpoint, but translation by the wearer invalidates the projection.
+The glasses' native 3DoF Anchor mode compensates head rotation; it does not
+provide the UNO Q with wearer translation.
+
+The illuminator must not become the moving viewer origin. CSI baselines and
+fingerprints depend on fixed transmitter/receiver geometry; moving the
+illuminator changes the measured RF field and makes wearer motion
+indistinguishable from target motion. Viewer tracking is a separate AR input.
+
 Design the page accordingly: pure `#000` background, no chrome, no panels, no
 white text on dark gray. Anything non-black is emitted light.
 
@@ -686,6 +703,20 @@ Recommendation: **build (a) first, then (b).** (a) unblocks the AR work in an
 afternoon. (b) is the real answer, and it reuses the same ArUco tooling as
 the training ground-truth rig (§9) — one detection stack, two consumers.
 
+For the Tier-0 fixed-view client, manual origin capture is reduced to a
+repeatable calibration procedure:
+
+1. Stand at the site config's marked viewer position and face the wall.
+2. Put the One Pro in Anchor mode and long-press the X button to recenter.
+3. Open the calibration grid and align its known wall edges using yaw, pitch,
+   and effective-FOV adjustments.
+4. Save those display-only offsets locally. They never alter hub estimates.
+
+For the final walking experience, the XREAL Eye and an SDK-supported Beam Pro
+or Samsung host provide the full wearer pose `T_W←H`. Unity computes
+`p_H = inverse(T_W←H) · p_W` for every estimate before stereo projection.
+The UNO Q still emits `p_W`; no protocol or sensing-model change is required.
+
 ### 8.4 Rendering
 
 - Marker at `(x, y)` from the estimate stream, at a plausible torso height.
@@ -705,9 +736,15 @@ the training ground-truth rig (§9) — one detection stack, two consumers.
 ### 8.5 Development decoupling
 
 The Unity app connects to a WebSocket emitting the §4.4 schema. A
-`tools/fake_hub.py` emits synthetic estimates — a dot on a circuit, a random
-walk, dropouts, uncertainty sweeps. The AR client is developed and tested
-entirely against it. No AR work is ever blocked on sensing, and vice versa.
+`tools/fake_hub.py` emits deterministic synthetic motion, presence
+transitions, stream pauses, and uncertainty sweeps. The AR client is developed
+and tested entirely against it. No AR work is ever blocked on sensing, and
+vice versa.
+
+The same fake hub serves the Tier-0 page and exercises presence transitions,
+uncertainty growth, stale-stream clearing, malformed-estimate rejection, and
+WebSocket reconnects. The fixed browser client and future Unity client are
+therefore consumers of the same contract, not separate hub modes.
 
 ---
 

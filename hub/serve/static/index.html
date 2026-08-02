@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>x-ray-wifi fixed-view overlay</title>
+  <style>
+    html, body { width:100%; height:100%; margin:0; overflow:hidden; background:#000; }
+    body { cursor:none; font-family:ui-monospace, Consolas, monospace; }
+    canvas { display:block; width:100%; height:100%; background:#000; }
+    .hud {
+      position:fixed; left:16px; bottom:14px; color:#76e9ff;
+      font-size:14px; line-height:1.45; text-shadow:0 0 8px #00b8ff;
+      white-space:pre; pointer-events:none;
+    }
+    .hidden { display:none; }
+    .calibration {
+      position:fixed; top:14px; left:16px; color:#ffd36a;
+      font-size:14px; line-height:1.45; text-shadow:0 0 8px #ff9d00;
+      white-space:pre; pointer-events:none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="overlay" aria-label="Through-wall position overlay"></canvas>
+  <div id="hud" class="hud hidden"></div>
+  <div id="calibration" class="calibration hidden"></div>
+  <script src="/geometry.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
