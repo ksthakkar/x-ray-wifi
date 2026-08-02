@@ -72,6 +72,8 @@ class NodeState:
         self.mac = ""
         self.deviation = 0.0
         self.dev_history = []
+        self.width = None      # locked frame width; others are ignored
+        self.other_width = 0   # count of dropped odd-width frames
 
     def update(self, hdr, csi):
         # ESP-IDF packs each subcarrier as an (imag, real) int8 pair.
@@ -85,11 +87,23 @@ class NodeState:
         if not amps:
             return
 
-        # Subcarrier count can change with frame type; a profile of one width
-        # cannot be compared against another, so restart when it changes.
-        if self.amps is None or len(self.amps) != len(amps):
+        # Lock onto ONE frame width and ignore all others.
+        #
+        # The radio interleaves frame types: a real capture was 10917 frames of
+        # 64 subcarriers with 7 stray 128-wide ones mixed in. Subcarrier i means
+        # a different frequency in each width, so they cannot share a profile --
+        # and an earlier version reset the reference whenever the width changed,
+        # which silently destroyed the frozen baseline a few seconds after every
+        # freeze. Locking to the first width seen and dropping the rest keeps the
+        # reference valid indefinitely.
+        if self.width is None:
+            self.width = len(amps)
+        if len(amps) != self.width:
+            self.other_width += 1
+            return
+
+        if self.amps is None:
             self.amps = list(amps)
-            self.reference = None
         else:
             for i, v in enumerate(amps):
                 self.amps[i] += SMOOTH_ALPHA * (v - self.amps[i])
@@ -105,10 +119,15 @@ class NodeState:
             self.lost += seq - self.prev_seq - 1
         self.prev_seq = seq
 
-        if self.reference:
-            n = min(len(self.reference), len(self.amps))
-            self.deviation = sum(abs(self.amps[i] - self.reference[i])
-                                 for i in range(n)) / n
+        if self.reference and len(self.reference) == len(self.amps):
+            n = len(self.reference)
+            # Normalise by the reference level, so deviation is a RELATIVE change
+            # (roughly "fraction of baseline amplitude"). An absolute L1 distance
+            # scales with signal strength, which made the number unbounded and
+            # incomparable between nodes at different distances.
+            ref_level = sum(self.reference) / n
+            raw = sum(abs(self.amps[i] - self.reference[i]) for i in range(n)) / n
+            self.deviation = raw / ref_level if ref_level > 1e-6 else 0.0
         else:
             self.deviation = 0.0
 
@@ -135,6 +154,7 @@ class NodeState:
             "deviation": round(self.deviation, 3),
             "dev_history": [round(v, 3) for v in self.dev_history],
             "stale": (time.time() - self.last_seen) > 3.0,
+            "other_width": self.other_width,
         }
 
 
@@ -252,6 +272,12 @@ INDEX_HTML = """<!doctype html>
 <div class="grid" id="grid"></div>
 <script>
 const grid=document.getElementById('grid'), statusEl=document.getElementById('status');
+// Deviation is a RELATIVE change (fraction of baseline amplitude), so a fixed
+// scale is meaningful: ~0.05 is noise, ~0.3 is a clear body-sized change.
+// Scale chosen against measured values: a simulated body blocking ~1/3 of the
+// subcarriers gives ~0.06, and an idle link sits near 0.005. Real bodies vary,
+// so treat these as a starting point and adjust from what you observe.
+const DEV_FULL_SCALE=0.15, DEV_ALERT=0.03;
 let ws, pending=null;
 const els={};
 
@@ -280,7 +306,8 @@ function fit(c){const r=c.getBoundingClientRect();
 function drawAmps(c,amps,ref){
   fit(c); const x=c.getContext('2d'),w=c.width,h=c.height;
   x.clearRect(0,0,w,h); if(!amps.length) return;
-  const mx=Math.max(...amps,...(ref||[]),1), bw=w/amps.length;
+  const all=amps.concat(ref||[]).filter(Number.isFinite);
+  const mx=all.reduce((a,b)=>Math.max(a,b),1), bw=w/amps.length;
   if(ref&&ref.length){x.fillStyle='#39404f';
     for(let i=0;i<ref.length;i++){const bh=ref[i]/mx*(h-4);
       x.fillRect(i*bw,h-bh,Math.max(bw-1,1),bh);}}
@@ -292,7 +319,10 @@ function drawAmps(c,amps,ref){
 function drawHist(c,hist){
   fit(c); const x=c.getContext('2d'),w=c.width,h=c.height;
   x.clearRect(0,0,w,h); if(hist.length<2) return;
-  const mx=Math.max(...hist,1), sx=w/239;
+  // Fixed scale with headroom, not auto-scale: auto-scaling to the running max
+  // meant one large spike permanently squashed the rest of the trace flat.
+  const peak=hist.reduce((a,b)=>Math.max(a,b),0);
+  const mx=Math.max(DEV_FULL_SCALE, Math.min(peak*1.15, DEV_FULL_SCALE*8)), sx=w/239;
   x.beginPath(); x.moveTo((239-hist.length+1)*sx,h);
   hist.forEach((v,i)=>x.lineTo((239-hist.length+1+i)*sx,h-v/mx*(h-4)));
   x.lineTo((239)*sx,h); x.closePath();
@@ -311,10 +341,11 @@ function render(){
     const e=ensure(n.node_id);
     e.root.classList.toggle('stale',n.stale);
     // Highlight when this link has clearly changed relative to its own history.
-    const hmax=Math.max(...(n.dev_history.length?n.dev_history:[0]),0.001);
-    e.root.classList.toggle('alert', n.has_ref && n.deviation > 0.5*hmax && hmax>0.05);
-    e.meta.textContent=`${n.rate}/s  ${n.rssi}dBm  ${n.n_sc}sc  lost ${n.lost}`;
-    e.dev.textContent = n.has_ref ? n.deviation.toFixed(2) : 'no ref';
+    const dev = Number.isFinite(n.deviation) ? n.deviation : 0;
+    e.root.classList.toggle('alert', n.has_ref && dev > DEV_ALERT);
+    e.meta.textContent=`${n.rate}/s  ${n.rssi}dBm  ${n.n_sc}sc  lost ${n.lost}`
+      + (n.other_width ? `  skipped ${n.other_width}` : '');
+    e.dev.textContent = n.has_ref ? dev.toFixed(3) : 'no ref';
     drawAmps(e.amp,n.amps,n.reference);
     drawHist(e.hist,n.dev_history);
   }
