@@ -70,6 +70,25 @@ latest_frames: dict[int, dict] = {}
 packets_received = 0
 packets_per_sec = 0.0
 
+# Heavier smoothing than the firmware's own (fast, jitter-only) EMA, applied
+# here purely for display/detection stability at the cost of a bit of lag.
+# Runs at the full ~50 Hz packet rate, not BROADCAST_HZ, so these alphas are
+# tuned for that rate.
+AMP_EMA_ALPHA = 0.15
+AMP_BAR_EMA_ALPHA = 0.2
+EXCESS_EMA_ALPHA = 0.12
+DISTANCE_EMA_ALPHA = 0.15
+
+# Hysteresis on presence: enter at the normal threshold, but require dropping
+# well below it to clear. Without this, excess hovering near the threshold
+# flickers PRESENCE on/off every tick even after EMA smoothing.
+PRESENCE_ON = MOTION_PRESENCE_THRESHOLD
+PRESENCE_OFF = MOTION_PRESENCE_THRESHOLD * 0.5
+
+# Per-node EMA/hysteresis state, keyed by node_id -- independent of the
+# per-node baselines each ESP32 already tracks on-device.
+smoothing_state: dict[int, dict] = {}
+
 
 def parse_packet(data: bytes):
     if len(data) < HEADER_SIZE:
@@ -129,8 +148,82 @@ class CSIProtocol(asyncio.DatagramProtocol):
         # timers below, off the hot path.
         global packets_received
         frame["addr"] = addr[0]
+        apply_smoothing(frame)
         latest_frames[frame["node_id"]] = frame
         packets_received += 1
+
+
+def apply_smoothing(frame: dict):
+    """Heavily smooth amplitude/excess/distance and add hysteresis to presence.
+
+    Mutates frame in place, adding smoothed values under new keys so the raw
+    on-device numbers stay available (console log, diagnostics) untouched.
+    Runs per packet, at the ESP32's native rate, so it settles fast despite
+    the low alphas -- BROADCAST_HZ only throttles what reaches the browser,
+    not how often this filter updates.
+    """
+    node_id = frame["node_id"]
+    state = smoothing_state.get(node_id)
+    amps = frame["amplitudes"]
+    amp_mean = (sum(amps) / len(amps)) if amps else 0.0
+
+    # Frame width (subcarrier count) can change frame-to-frame (interleaved
+    # non-HT/HT frames -- see main.c's presence_slot logic), so a per-index
+    # amplitude EMA only makes sense while width is stable; reset on change.
+    if state is not None and len(state.get("amplitudes", [])) != len(amps):
+        state = None
+
+    if state is None or frame["excess"] is None:
+        # First packet for this node/width, or firmware still warming up its
+        # own baseline: nothing to smooth against yet, just pass values through.
+        state = {
+            "amp_mean": amp_mean,
+            "amplitudes": list(amps),
+            "excess": frame["excess"] or 0.0,
+            "distance_m": frame["distance_m"],
+            "presence": False,
+        }
+        smoothing_state[node_id] = state
+        frame["amp_mean_smooth"] = amp_mean
+        frame["amplitudes_smooth"] = amps
+        frame["excess_smooth"] = frame["excess"]
+        frame["distance_m_smooth"] = frame["distance_m"]
+        frame["presence_smooth"] = False
+        return
+
+    state["amp_mean"] += AMP_EMA_ALPHA * (amp_mean - state["amp_mean"])
+    smoothed_amps = state["amplitudes"]
+    for i, a in enumerate(amps):
+        smoothed_amps[i] += AMP_BAR_EMA_ALPHA * (a - smoothed_amps[i])
+    state["excess"] += EXCESS_EMA_ALPHA * (frame["excess"] - state["excess"])
+
+    if frame["distance_m"] is None:
+        # No target this packet -- hold the last smoothed distance rather
+        # than snapping to "no target" instantly, so one dropped detection
+        # doesn't blank the radar for a frame in an otherwise steady reading.
+        pass
+    elif state["distance_m"] is None:
+        state["distance_m"] = frame["distance_m"]
+    else:
+        state["distance_m"] += DISTANCE_EMA_ALPHA * (frame["distance_m"] - state["distance_m"])
+
+    # Hysteresis: separate on/off thresholds so smoothed excess hovering near
+    # the boundary doesn't flip presence every tick.
+    if state["presence"]:
+        state["presence"] = state["excess"] >= PRESENCE_OFF
+    else:
+        state["presence"] = state["excess"] >= PRESENCE_ON
+
+    # Once smoothed presence clears, drop the held distance too -- otherwise
+    # a stale reading would linger on the radar after someone actually left.
+    if not state["presence"]:
+        state["distance_m"] = None
+
+    frame["amp_mean_smooth"] = state["amp_mean"]
+    frame["amplitudes_smooth"] = list(smoothed_amps)
+    frame["excess_smooth"] = state["excess"]
+    frame["distance_m_smooth"] = state["distance_m"]
+    frame["presence_smooth"] = state["presence"]
 
 
 def compute_fusion(frames: dict[int, dict]):
@@ -150,9 +243,10 @@ def compute_fusion(frames: dict[int, dict]):
 
     # Nodes still building their baseline don't get a vote either way --
     # counting them as "no presence" would bias fusion toward false negatives
-    # every time a node restarts.
+    # every time a node restarts. Votes use the smoothed+hysteresis presence,
+    # not raw excess, so fusion inherits the same flicker suppression.
     voting = [f for f in active if f["excess"] is not None]
-    node_presence = [f["excess"] >= MOTION_PRESENCE_THRESHOLD for f in voting]
+    node_presence = [f["presence_smooth"] for f in voting]
     voting_count = len(voting)
     agree_count = sum(node_presence)
 
@@ -160,9 +254,9 @@ def compute_fusion(frames: dict[int, dict]):
     confidence = (agree_count / voting_count) if voting_count > 0 else 0.0
 
     distances = [
-        f["distance_m"]
+        f["distance_m_smooth"]
         for f, present in zip(voting, node_presence)
-        if present and f["distance_m"] is not None
+        if present and f["distance_m_smooth"] is not None
     ]
     fused_distance_m = (sum(distances) / len(distances)) if distances else None
 
@@ -202,17 +296,13 @@ async def broadcast_loop():
                     "rssi": frame["rssi"],
                     "noise_floor": frame["noise_floor"],
                     "num_subcarriers": frame["num_subcarriers"],
-                    "amplitudes": amps,
-                    "amp_mean": (sum(amps) / len(amps)) if amps else 0.0,
+                    "amplitudes": frame.get("amplitudes_smooth", amps),
+                    "amp_mean": frame["amp_mean_smooth"],
                     "motion": frame["motion"],
-                    "excess": frame["excess"],
+                    "excess": frame["excess_smooth"],
                     "csi_floor": frame["csi_floor"],
-                    "distance_m": frame["distance_m"],
-                    # Presence is judged on excess, not the raw score.
-                    "presence": (
-                        frame["excess"] is not None
-                        and frame["excess"] >= MOTION_PRESENCE_THRESHOLD
-                    ),
+                    "distance_m": frame["distance_m_smooth"],
+                    "presence": frame["presence_smooth"],
                 }
             )
         if not nodes:
