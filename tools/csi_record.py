@@ -52,24 +52,114 @@ HEADER_FIELDS = [
     "first_word_invalid", "phy_variant", "mac", "csi_len",
 ]
 
-# The interleaved default protocol. Alternating blocks decorrelate presence from
-# slow environmental drift; the trailing empty block gives a second baseline to
-# compare against the first (an empty-vs-empty control, which is what tells you
-# your analysis' false-positive rate).
-DEFAULT_PROTOCOL = [
-    ("hand_on_board", 30, "Hold your hand right over the board. KNOWN-POSITIVE check: "
-                          "if analysis can't see this, the pipeline is broken and a "
-                          "null result elsewhere means nothing."),
+# --- Protocol v1 (session 1). Kept for reproducing that capture only.
+#
+# Two flaws found after the fact, both fixed in v2 below:
+#   1. Its "empty" blocks were not empty -- the operator was behind a wall, often
+#      moving. So it had no true baseline, and "is presence detectable" could not
+#      be answered from it at all.
+#   2. One or two blocks per condition. Blocks are the unit of statistical power,
+#      so with 1-vs-3 blocks the smallest achievable permutation p-value is 0.25:
+#      no effect size, however large, can reach significance.
+PROTOCOL_V1 = [
+    ("hand_on_board", 30, "Hold your hand right over the board."),
     ("sitting", 30, "Sit still in the room, ~1-2 m from the board."),
     ("moving", 30, "Move around the room actively."),
     ("empty", 60, "Leave the room entirely. Close the door."),
     ("moving", 30, "Come back in and move around actively."),
     ("sitting", 30, "Sit still again, same spot as before."),
     ("empty", 60, "Leave the room again."),
-    ("next_room", 60, "Go to the ADJACENT room and move around. THE REAL TEST."),
-    ("empty_end", 60, "Leave the room. Final baseline -- pairs with the earlier "
-                      "'empty' blocks as an empty-vs-empty control."),
+    ("next_room", 60, "Go to the ADJACENT room and move around."),
+    ("empty_end", 60, "Leave the room. Final baseline."),
 ]
+
+# --- Protocol v2: many short blocks, a genuine empty baseline, explicit locations.
+#
+# Design rationale, in priority order:
+#
+#   * MANY SHORT BLOCKS. 6 blocks per condition instead of 1-2. This is the
+#     single highest-leverage change: it moves the permutation p-floor from 0.25
+#     to well under 0.001, so a real effect can actually register as significant.
+#
+#   * A TRULY EMPTY CONDITION. Nobody in the building, or at minimum two rooms
+#     away and stationary. Session 1 had none, which made every "presence" claim
+#     uninterpretable. This is the reference everything else is measured against.
+#
+#   * LOCATIONS, NOT VAGUE LABELS. "empty" hid the fact that the operator was
+#     behind a wall. Names here state where the body actually is.
+#
+#   * INTERLEAVED. Conditions alternate so presence is decorrelated from slow
+#     drift (traffic, temperature, AP behaviour).
+#
+#   * STILL vs MOVING SEPARATED. Session 1 showed the top features track motion,
+#     not presence; keeping these apart is the only way to tell them apart.
+#
+# ~30 s blocks: long enough for 3+ breathing cycles at 0.1-0.5 Hz, short enough
+# to fit many of them into one session.
+PROTOCOL_V2 = [
+    ("truly_empty", 30, "NOBODY in the room or adjacent rooms. Go two rooms away "
+                        "(or outside) and stay still. THE baseline."),
+    ("in_room_still", 30, "Sit still in the middle of the room."),
+    ("truly_empty", 30, "Two rooms away again, stay still."),
+    ("in_room_moving", 30, "Walk around the room continuously."),
+    ("truly_empty", 30, "Two rooms away, still."),
+    ("wall_a_still", 30, "Stand just behind WALL A, STAY STILL."),
+    ("truly_empty", 30, "Two rooms away, still."),
+    ("wall_a_moving", 30, "Just behind WALL A, moving around."),
+    ("truly_empty", 30, "Two rooms away, still."),
+    ("in_room_still", 30, "Sit still in the middle of the room (same spot as before)."),
+    ("truly_empty", 30, "Two rooms away, still."),
+    ("wall_b_still", 30, "Stand just behind WALL B, STAY STILL."),
+    ("truly_empty", 30, "Two rooms away, still."),
+    ("wall_b_moving", 30, "Just behind WALL B, moving around."),
+    ("truly_empty", 30, "Two rooms away, still."),
+    ("in_room_moving", 30, "Walk around the room continuously."),
+    ("truly_empty", 30, "Two rooms away, still."),
+    ("wall_a_still", 30, "Just behind WALL A, still."),
+    ("truly_empty", 30, "Two rooms away, still."),
+    ("wall_b_still", 30, "Just behind WALL B, still."),
+    ("truly_empty", 30, "Two rooms away, still."),
+    ("in_room_still", 30, "Sit still in the middle of the room."),
+    ("truly_empty", 30, "Two rooms away, still."),
+    ("wall_a_moving", 30, "Just behind WALL A, moving."),
+    ("truly_empty", 30, "Two rooms away, still."),
+    ("wall_b_moving", 30, "Just behind WALL B, moving."),
+    ("truly_empty", 30, "Final baseline. Two rooms away, still."),
+    ("hand_on_board", 30, "Hold your hand over NODE 1's antenna. KNOWN-POSITIVE: "
+                          "if analysis misses this, the pipeline is broken and any "
+                          "null result elsewhere is meaningless."),
+]
+
+# Position-tagged variant: instead of coarse zones, stand at numbered marked
+# spots. This is what makes position ESTIMATION (not just detection) testable --
+# each spot is a labelled ground-truth coordinate. Mark spots on the floor with
+# tape and record their coordinates in the session notes.
+PROTOCOL_POSITIONS = [
+    ("truly_empty", 30, "Nobody present. Baseline."),
+    ("pos_1_still", 30, "Stand STILL on marked spot 1."),
+    ("truly_empty", 30, "Leave. Baseline."),
+    ("pos_2_still", 30, "Stand STILL on marked spot 2."),
+    ("truly_empty", 30, "Leave. Baseline."),
+    ("pos_3_still", 30, "Stand STILL on marked spot 3."),
+    ("truly_empty", 30, "Leave. Baseline."),
+    ("pos_4_still", 30, "Stand STILL on marked spot 4."),
+    ("truly_empty", 30, "Leave. Baseline."),
+    ("pos_1_still", 30, "Spot 1 again (repeat -- tests reproducibility)."),
+    ("truly_empty", 30, "Leave. Baseline."),
+    ("pos_2_still", 30, "Spot 2 again."),
+    ("truly_empty", 30, "Leave. Baseline."),
+    ("pos_3_still", 30, "Spot 3 again."),
+    ("truly_empty", 30, "Leave. Baseline."),
+    ("pos_4_still", 30, "Spot 4 again."),
+    ("truly_empty", 30, "Final baseline."),
+]
+
+PROTOCOLS = {
+    "v1": PROTOCOL_V1,
+    "v2": PROTOCOL_V2,
+    "positions": PROTOCOL_POSITIONS,
+}
+DEFAULT_PROTOCOL = PROTOCOL_V2
 
 
 class Recorder:
@@ -103,13 +193,15 @@ class Recorder:
         self.label_started = time.time()
         self.label_note = ""
         self.quiet = False  # suppress the status line during a countdown
+        self.node_positions = {}  # node_id -> {xy_m, note}; set before the run
 
         self.frames = 0
         self.bytes_written = 0
         self.bad_magic = 0
         self.short = 0
-        self.lost = 0            # inferred from sequence gaps
+        self.lost = 0            # inferred from sequence gaps (summed over nodes)
         self.prev_seq = None
+        self.per_node = {}       # node_id -> {frames, lost, prev, first, last}
         self.per_label = {}      # label -> frame count
         self.sc_counts = {}      # subcarrier count -> frames (catches width mixing)
         self.first_recv = None
@@ -144,9 +236,18 @@ class Recorder:
         # Sequence gaps mean UDP loss in flight (or ESP32 queue drops). Recorded
         # rather than hidden: a gap is missing data, and analysis needs to know.
         seq = hdr["sequence"]
-        if self.prev_seq is not None and seq > self.prev_seq + 1:
-            self.lost += seq - self.prev_seq - 1
-        self.prev_seq = seq
+        # Per-node bookkeeping: with several nodes streaming to one recorder,
+        # each has its own sequence counter, so a single shared prev_seq would
+        # report huge phantom loss as the streams interleave.
+        nid = hdr["node_id"]
+        st = self.per_node.setdefault(nid, {"frames": 0, "lost": 0, "prev": None,
+                                            "first": now, "last": now})
+        st["frames"] += 1
+        st["last"] = now
+        if st["prev"] is not None and seq > st["prev"] + 1:
+            st["lost"] += seq - st["prev"] - 1
+        st["prev"] = seq
+        self.lost = sum(v["lost"] for v in self.per_node.values())
 
         # Length-prefixed record, then the host receive time, then the datagram
         # verbatim. Storing the raw datagram means nothing is lost to parsing
@@ -193,10 +294,18 @@ class Recorder:
             "bad_magic": self.bad_magic,
             "short_packets": self.short,
             "frames_per_label": self.per_label,
+            "per_node": {
+                str(k): {
+                    "frames": v["frames"], "lost": v["lost"],
+                    "rate_hz": (v["frames"] / (v["last"] - v["first"])
+                                if v["last"] > v["first"] else 0.0),
+                } for k, v in self.per_node.items()
+            },
             # Labels prefixed "transition_" are walking-into-position periods and
             # MUST be excluded from analysis: they contain motion that belongs to
             # neither the preceding nor following condition.
             "exclude_label_prefix": "transition_",
+            "node_positions": self.node_positions,
             "subcarrier_counts": {str(k): v for k, v in self.sc_counts.items()},
             "mean_rate_hz": (
                 self.frames / (self.last_recv - self.first_recv)
@@ -234,10 +343,12 @@ async def status_loop(rec: Recorder, interval: float = 2.0):
         if rec.quiet:
             continue
         elapsed = time.time() - rec.label_started
-        widths = ",".join(f"{k}sc" for k in sorted(rec.sc_counts))
+        # Per-node counts, so a silent second node is obvious immediately rather
+        # than discovered after the run.
+        nodes = "/".join(f"n{k}:{v['frames']}" for k, v in sorted(rec.per_node.items()))
         sys.stdout.write(
             f"\r[{rec.label}] {elapsed:5.1f}s | {n:>7} frames | {rate:5.1f}/s "
-            f"| lost {rec.lost} | widths {widths or '-'}    "
+            f"| lost {rec.lost} | {nodes or 'no nodes'}    "
         )
         sys.stdout.flush()
 
@@ -323,6 +434,80 @@ async def manual_labels(rec: Recorder):
             print(f"  -> label now '{lbl}'")
 
 
+def collect_node_positions(expected, existing=None):
+    """Prompt for where each node physically is.
+
+    Without positions, N nodes are just N uncalibrated sensors and no spatial
+    inference is possible -- the geometry IS the information. Recorded into the
+    sidecar so a capture stays interpretable months later.
+
+    Coordinates are free-form (metres from a room corner is the easy convention);
+    a description alone is still better than nothing.
+    """
+    if existing:
+        print(f"\nreusing node positions from {existing}")
+        return existing_positions(existing)
+
+    print(f"\n{'='*66}")
+    print("  NODE POSITIONS")
+    print("  Enter where each node is. 'x,y' in metres from one room corner is")
+    print("  ideal; a description alone is still useful. Blank to skip a node.")
+    print(f"{'='*66}")
+    pos = {}
+    for nid in expected:
+        raw = input(f"  node {nid} position (e.g. '0.5,2.1 NE corner on shelf'): ").strip()
+        if raw:
+            xy, desc = None, raw
+            parts = raw.split(None, 1)
+            if "," in parts[0]:
+                try:
+                    a, b = parts[0].split(",")[:2]
+                    xy = [float(a), float(b)]
+                    desc = parts[1] if len(parts) > 1 else ""
+                except ValueError:
+                    xy = None
+            pos[str(nid)] = {"xy_m": xy, "note": desc}
+    extra = input("  room notes (dimensions, wall A/B, AP location, spots 1-4): ").strip()
+    if extra:
+        pos["_room"] = {"note": extra}
+    return pos
+
+
+def existing_positions(path):
+    try:
+        with open(path) as f:
+            return json.load(f).get("node_positions", {})
+    except (OSError, ValueError):
+        return {}
+
+
+async def wait_for_nodes(rec, expected_ids, timeout=90):
+    """Block until every expected node has reported, or timeout.
+
+    With five boards, one silently failing is the likeliest way to waste a
+    session; catching it before the protocol starts costs seconds.
+    """
+    print(f"\nwaiting for nodes {sorted(expected_ids)} to report...")
+    waited = 0.0
+    while waited < timeout:
+        seen = set(rec.per_node)
+        missing = set(expected_ids) - seen
+        if not missing:
+            print(f"  all {len(expected_ids)} nodes reporting: " +
+                  ", ".join(f"n{k}={rec.per_node[k]['frames']}" for k in sorted(seen)))
+            return True
+        await asyncio.sleep(1.0)
+        waited += 1.0
+        if waited % 10 == 0:
+            print(f"  {waited:.0f}s: have {sorted(seen) or 'none'}, "
+                  f"still missing {sorted(missing)}")
+    seen = set(rec.per_node)
+    missing = set(expected_ids) - seen
+    print(f"\n  !! TIMEOUT: nodes {sorted(missing)} never reported.")
+    ans = input("  Continue with only the nodes present? [y/N]: ").strip().lower()
+    return ans == "y"
+
+
 def lan_ip() -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -350,6 +535,15 @@ async def main():
                    help="seconds between blocks to walk into position (default 15)")
     p.add_argument("--label", default="check",
                    help="label to use with --duration (default 'check')")
+    p.add_argument("--protocol-name", default="v2", choices=sorted(PROTOCOLS),
+                   help="which protocol to run (default v2)")
+    p.add_argument("--nodes", default="",
+                   help="comma-separated node IDs expected, e.g. 1,2,3,4,5. "
+                        "The run waits for all of them before starting.")
+    p.add_argument("--positions-from",
+                   help="reuse node_positions from a previous .json sidecar")
+    p.add_argument("--no-positions", action="store_true",
+                   help="skip the node-position prompts")
     args = p.parse_args()
 
     rec = Recorder(args.out, args.csv)
@@ -382,10 +576,30 @@ async def main():
                   f"on Wi-Fi, and CSI_TARGET_IP points at {lan_ip()}.")
     print(f"Frames arriving. Good.\n")
 
+    # Pre-flight: confirm every expected node is alive before committing to a
+    # long protocol, and record where they are.
+    expected = []
+    if args.nodes:
+        expected = [int(x) for x in args.nodes.split(",") if x.strip()]
+        ok = await wait_for_nodes(rec, expected)
+        if not ok:
+            transport.close()
+            rec.close()
+            sys.exit("aborted: not all expected nodes present")
+
+    if args.protocol and not args.no_positions:
+        ids = expected or sorted(rec.per_node)
+        loop2 = asyncio.get_running_loop()
+        rec.node_positions = await loop2.run_in_executor(
+            None, collect_node_positions, ids, args.positions_from)
+
     tasks = [asyncio.create_task(status_loop(rec))]
     main_task = None
     if args.protocol:
-        main_task = asyncio.create_task(run_protocol(rec, DEFAULT_PROTOCOL, args.lead_in))
+        proto = PROTOCOLS[args.protocol_name]
+        print(f"\nusing protocol '{args.protocol_name}' "
+              f"({len(proto)} blocks)")
+        main_task = asyncio.create_task(run_protocol(rec, proto, args.lead_in))
         tasks.append(main_task)
     elif args.duration <= 0:
         # Only read stdin when we have no other stop condition. A blocking
@@ -415,6 +629,14 @@ async def main():
         print(f"  lost (seq gap): {meta['lost_inferred']}")
         print(f"  size          : {meta['bytes']/1048576:.1f} MB")
         print(f"  widths seen   : {meta['subcarrier_counts']}")
+        if meta["per_node"]:
+            print(f"  per node      :")
+            for k, v in sorted(meta["per_node"].items()):
+                print(f"      node {k}: {v['frames']} frames, "
+                      f"{v['rate_hz']:.1f} Hz, {v['lost']} lost")
+            if len(meta["per_node"]) == 1:
+                print("      ^ only ONE node reported. If you expected two, the "
+                      "second is not streaming.")
         print(f"  per label     :")
         for k, v in meta["frames_per_label"].items():
             print(f"      {k:<20} {v}")

@@ -71,8 +71,20 @@ def main():
     rx_state_nonzero = 0
     total = 0
 
+    # Group by contiguous BLOCK, not by label name. The same label recurs (the
+    # protocol interleaves), and merging repeats makes a block's "duration" span
+    # everything in between, which reports a meaninglessly low rate.
+    blocks = []       # [label, t_first, t_last, count, zero, sum_amp]
+    prev_label = None
+
     for recv, label, hdr, csi in read_records(args.path):
         total += 1
+        if label != prev_label:
+            blocks.append([label, recv, recv, 0, 0, 0.0])
+            prev_label = label
+        b = blocks[-1]
+        b[2] = recv
+        b[3] += 1
         e = per_label.setdefault(label, [0, recv, recv, 0, 0.0])
         e[0] += 1
         e[2] = recv
@@ -81,8 +93,11 @@ def main():
         # like a valid record but carries no channel information at all.
         if not any(csi):
             e[3] += 1
+            b[4] += 1
         else:
-            e[4] += sum(abs(b - 256 if b > 127 else b) for b in csi) / len(csi)
+            amp = sum(abs(v - 256 if v > 127 else v) for v in csi) / len(csi)
+            e[4] += amp
+            b[5] += amp
 
         widths[hdr["num_subcarriers"]] = widths.get(hdr["num_subcarriers"], 0) + 1
         seqs.append(hdr["sequence"])
@@ -124,16 +139,19 @@ def main():
     if rx_state_nonzero:
         print(f"rx_state nonzero on {rx_state_nonzero} frames (driver flagged them)")
 
-    print(f"\n{'label':<32} {'frames':>7} {'sec':>6} {'Hz':>6} {'zero':>6} {'mean|iq|':>9}")
-    print("-" * 72)
+    print(f"\nper BLOCK (contiguous run of one label):")
+    print(f"{'#':>3} {'label':<28} {'frames':>7} {'sec':>6} {'Hz':>6} {'zero':>5} {'mean|iq|':>9}")
+    print("-" * 70)
     rates = {}
-    for label, (n, t0, t1, zeros, amp) in sorted(per_label.items()):
+    for i, (label, t0, t1, n, zeros, amp) in enumerate(blocks, 1):
         dur = t1 - t0
         hz = n / dur if dur > 0 else 0
         mean_amp = amp / max(n - zeros, 1)
-        print(f"{label:<32} {n:>7} {dur:>6.1f} {hz:>6.1f} {zeros:>6} {mean_amp:>9.1f}")
+        print(f"{i:>3} {label:<28} {n:>7} {dur:>6.1f} {hz:>6.1f} {zeros:>5} {mean_amp:>9.1f}")
         if not label.startswith("transition_") and label != "unlabeled":
-            rates[label] = hz
+            rates.setdefault(label, []).append(hz)
+    # Compare conditions on their per-block rates.
+    rates = {k: sum(v) / len(v) for k, v in rates.items()}
 
     # The headline confound: if frame rate tracks the condition, a "signal" may
     # just be a traffic difference. Flag it here rather than after analysis.

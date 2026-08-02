@@ -26,6 +26,9 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "credentials.h"
+#include "role.h"
+
+#if CSI_ROLE == CSI_ROLE_RX
 
 // --- CONFIGURATION ---
 // Array sizes must be true compile-time constants in C, so those live in an
@@ -42,7 +45,12 @@ enum
 
 static const char *TARGET_IP = CSI_TARGET_IP;
 static const uint16_t TARGET_PORT = CSI_TARGET_PORT;
-static const uint8_t NODE_ID = 1;
+// Per-board ID from credentials.h; each board must differ so the recorder can
+// tell their streams apart. Defaults to 1 for older credentials.h files.
+#ifndef CSI_NODE_ID
+#define CSI_NODE_ID 1
+#endif
+static const uint8_t NODE_ID = CSI_NODE_ID;
 // Magic 0xC5110003: capture format v3 (v1 raw, v2 added on-device presence).
 static const uint32_t ADR018_MAGIC = 0xC5110003;
 static const uint8_t NUM_ANTENNAS = 1;
@@ -55,6 +63,12 @@ static const uint32_t SEND_ERR_LOG_EVERY = 100;
 static const uint32_t QUEUE_DROP_LOG_EVERY = 200;
 // Warn when the queue high-water mark reaches this fraction of its depth.
 static const uint32_t QUEUE_WARN_NUM = 3, QUEUE_WARN_DEN = 4; // 3/4 full
+
+// Channel the transmitter broadcasts on. Must match transmitter.c, or the
+// receiver will never see its frames.
+#ifndef CSI_CHANNEL
+#define CSI_CHANNEL 1
+#endif
 // ---------------------
 
 static const char *TAG = "ESP32_CSI_NODE";
@@ -457,6 +471,23 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 
         esp_wifi_set_ps(WIFI_PS_NONE); // Disable sleep
 
+        // Report the channel we actually ended up on. CSI only appears for
+        // frames the radio is tuned to, so if the AP put us on a different
+        // channel than the transmitter is using, no beacons will be seen at all
+        // -- a silent failure worth surfacing loudly.
+        uint8_t ch = 0;
+        wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
+        if (esp_wifi_get_channel(&ch, &sec) == ESP_OK)
+        {
+            ESP_LOGI(TAG, "listening on channel %u", (unsigned)ch);
+            if (ch != CSI_CHANNEL)
+                ESP_LOGW(TAG, "CHANNEL MISMATCH: on ch %u but transmitter uses ch %u. "
+                              "Move the AP to ch %u, or rebuild with "
+                              "-DCSI_CHANNEL=%u.",
+                         (unsigned)ch, (unsigned)CSI_CHANNEL,
+                         (unsigned)CSI_CHANNEL, (unsigned)ch);
+        }
+
         ESP_LOGI(TAG, "Streaming raw CSI -> %s:%u (UDP), header %u bytes, magic 0x%08lX",
                  TARGET_IP, (unsigned)TARGET_PORT,
                  (unsigned)sizeof(csi_capture_header_t), (unsigned long)ADR018_MAGIC);
@@ -509,3 +540,5 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 }
+
+#endif /* CSI_ROLE == CSI_ROLE_RX */
