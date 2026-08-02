@@ -39,6 +39,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_now.h"
+#include "esp_idf_version.h" // ESP_IDF_VERSION / ESP_IDF_VERSION_VAL for the cb guard
 #include "esp_timer.h"
 #include "esp_mac.h"
 #include "nvs_flash.h"
@@ -75,13 +76,34 @@ static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static uint32_t s_seq;
 static uint32_t s_sent, s_failed;
 
-static void on_send(const uint8_t *mac, esp_now_send_status_t status)
+/*
+ * ESP-IDF changed esp_now_send_cb_t from
+ *     void (*)(const uint8_t *mac, esp_now_send_status_t)
+ * to
+ *     void (*)(const esp_now_send_info_t *tx_info, esp_now_send_status_t)
+ *
+ * The guard has to be the full version triple, not ESP_IDF_VERSION_MAJOR:
+ * Espressif backported the new signature to v5.5, where esp_now_send_info_t is
+ * a typedef of wifi_tx_info_t. (Same fix as the ruview reference node.)
+ *
+ * The body is identical either way -- only `status` is used, and broadcast is
+ * never acked, so "failure" here only reflects local queueing.
+ */
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+static void on_send(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 {
-    (void)mac;
-    // Broadcast is never acked, so "failure" here only reflects local queueing.
+    (void)tx_info;
     if (status != ESP_NOW_SEND_SUCCESS)
         s_failed++;
 }
+#else
+static void on_send(const uint8_t *mac, esp_now_send_status_t status)
+{
+    (void)mac;
+    if (status != ESP_NOW_SEND_SUCCESS)
+        s_failed++;
+}
+#endif
 
 static void tx_task(void *arg)
 {
